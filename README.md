@@ -1,4 +1,4 @@
-# 🎓 Exam Behavior Anomaly Detection
+# Exam Behavior Anomaly Detection
 
 An AI-powered system to detect cheating behavior in online exams using **Isolation Forest** algorithm.
 
