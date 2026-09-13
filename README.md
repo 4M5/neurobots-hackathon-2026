@@ -1,186 +1,213 @@
 # Exam Behavior Anomaly Detection
 
-An AI-powered system to detect cheating behavior in online exams using **Isolation Forest** algorithm.
+An anomaly detection prototype for identifying potentially suspicious
+behavior during online exams.
 
-## 📋 Overview
+Developed as a team project for the IIT Palakkad Hackathon.
 
-This project demonstrates anomaly detection for online exam proctoring by analyzing behavioral patterns:
+## Overview
 
-- **Normal Students**: Consistent typing, minimal tab switches, focused exam-taking
-- **Cheating Behavior**: Copy-pasting, frequent tab switches, irregular typing patterns
+Online exams generate behavioral signals such as typing patterns, tab
+switching, paste events, focus changes, and idle time. This project uses
+machine learning to identify behavior that deviates from normal patterns.
 
-The system uses unsupervised machine learning (IsolationForest) to learn what "normal" looks like, then flags deviations as potential cheating.
+The system uses Isolation Forest for anomaly detection and integrates
+the Gemini API to generate natural-language explanations of detected
+anomalies.
 
-## 🔧 Setup Instructions
+This is a hackathon prototype and is not intended to definitively
+determine whether a student is cheating.
 
-### Step 1: Create the Conda Environment
+## Features
 
-Open Anaconda Prompt (or terminal) and run:
+- Behavioral anomaly detection using Isolation Forest
+- Analysis of 12 behavioral features
+- Synthetic dataset generation
+- Model training and testing
+- Flask-based web application
+- Gemini API integration for anomaly explanations
+- Web interface for entering behavioral data and viewing results
+
+## Behavioral Features
+
+The model uses the following behavioral signals:
+
+- Average key interval
+- Standard deviation of key intervals
+- Typing speed
+- Backspace rate
+- Paste count
+- Tab switches
+- Focus loss
+- Average idle time
+- Maximum idle time
+- Answer edits
+- Time to first key
+- Answer duration
+
+## Machine Learning Approach
+
+The project uses **Isolation Forest**, an unsupervised anomaly detection
+algorithm.
+
+The model learns patterns from normal behavioral samples and assigns an
+anomaly score to new observations. Samples that significantly differ from
+the learned normal behavior are flagged as potential anomalies.
+
+An anomaly does not necessarily indicate cheating. Unusual behavior can
+also occur because of legitimate differences between users.
+
+## Dataset
+
+The current implementation uses synthetic behavioral data for
+demonstration and experimentation.
+
+- 800 normal samples
+- 200 anomalous samples
+- 12 behavioral features
+
+Since the dataset is synthetic, the results should not be interpreted as
+real-world cheating detection performance.
+
+## Gemini Integration
+
+Gemini is used to generate a natural-language explanation for detected
+anomalies.
+
+The API key can be configured through an environment variable:
+
+```text
+GEMINI_API_KEY=your_api_key
+
+## Project Structure
+
+```text
+.
+├── generate_dataset.py
+├── train_model.py
+├── test_model.py
+├── server.py
+├── index.html
+├── app.js
+├── styles.css
+├── requirements.txt
+└── README.md
+
+## Installation
+
+### 1. Clone the repository
 
 ```bash
-# Create new environment with Python 3.10
-conda create -n exam_hack python=3.10 -y
+git clone <your-fork-url>
+cd neurobots-hackathon-2026
+```
 
-# Activate the environment
+### 2. Create a Python environment
+
+Using Conda:
+
+```bash
+conda create -n exam_hack python=3.10 -y
 conda activate exam_hack
 ```
 
-### Step 2: Install Dependencies
+Or using Python virtual environment:
 
 ```bash
-# Install required packages
-pip install numpy pandas scikit-learn joblib flask google-generativeai python-dotenv
+python -m venv venv
 ```
 
-Or using conda:
+Activate on Windows:
 
 ```bash
-conda install numpy pandas scikit-learn joblib -y
-pip install flask google-generativeai python-dotenv
+venv\Scripts\activate
 ```
 
-### Step 3: Setup Gemini API (Optional)
-
-1. Get your API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
-2. Create a `.env` file in the project root:
-   ```bash
-   cp .env.example .env
-   ```
-3. Edit `.env` and add your key:
-   ```
-   GEMINI_API_KEY=your_actual_api_key_here
-   ```
-
-### Step 4: Navigate to Project Folder
+Activate on Linux/macOS:
 
 ```bash
-cd path/to/project_root
+source venv/bin/activate
 ```
 
-## 🚀 Running the Project
+### 3. Install dependencies
 
-Run the scripts **in order**:
+```bash
+pip install -r requirements.txt
+```
 
-### 1️⃣ Generate Dataset
+## Usage
+
+### 1. Generate the dataset
 
 ```bash
 python generate_dataset.py
 ```
 
-**What it does:**
-- Creates synthetic exam behavior data
-- Generates 800 normal + 200 cheating samples
-- Saves as `behavior_dataset.csv`
-
-**Output:** You'll see statistics about the generated dataset
-
-### 2️⃣ Train the Model
+### 2. Train the model
 
 ```bash
 python train_model.py
 ```
 
-**What it does:**
-- Loads the dataset
-- Trains IsolationForest on NORMAL samples only
-- Saves model as `behavior_model.pkl`
-
-**Output:** Training progress and model evaluation
-
-### 3️⃣ Test the Model
+### 3. Test the model
 
 ```bash
 python test_model.py
 ```
 
-**What it does:**
-- Loads the trained model
-- Tests on suspicious sample cases
-- Evaluates on full dataset
-- Optional: Interactive custom testing
+### 4. Configure Gemini API
 
-**Output:** Per-sample predictions and accuracy metrics
+Create a `.env` file:
 
-## 📊 Understanding the Output
-
-### Predictions
-
-| Output | Meaning |
-|--------|---------|
-| ✅ NORMAL | Behavior is within expected patterns |
-| 🚨 ANOMALY | Behavior deviates significantly (potential cheating) |
-
-### Anomaly Score
-
-- **Higher scores (closer to 0)**: More normal behavior
-- **Lower scores (negative)**: More anomalous behavior
-
-### Features Analyzed
-
-| Feature | Description |
-|---------|-------------|
-| `avg_key_interval` | Average time between keystrokes (seconds) |
-| `std_key_interval` | Consistency of typing rhythm |
-| `typing_speed` | Characters per minute |
-| `backspace_rate` | Ratio of corrections to total keystrokes |
-| `paste_count` | Number of paste operations |
-| `tab_switch` | Number of tab/window switches |
-| `focus_loss` | Times the exam window lost focus |
-| `avg_idle` | Average idle time between actions |
-| `max_idle` | Longest idle period |
-| `edit_count` | Number of answer modifications |
-| `time_to_first_key` | Time from question display to first key |
-| `answer_duration` | Total time spent on answer |
-
-## 🧠 How IsolationForest Works
-
-1. **Training Phase**: The model builds "isolation trees" from normal behavior samples
-2. **Each tree** randomly selects features and split points to isolate data points
-3. **Normal points** are harder to isolate (require more splits)
-4. **Anomalies** are easier to isolate (require fewer splits)
-5. **Detection**: New samples requiring few splits → flagged as anomalies
-
-## 📁 Project Structure
-
-```
-/
-├── README.md              # This file
-├── generate_dataset.py    # Creates synthetic training data
-├── train_model.py         # Trains the IsolationForest model
-├── test_model.py          # Tests and evaluates the model
-├── behavior_dataset.csv   # Generated after running generate_dataset.py
-├── behavior_model.pkl     # Generated after running train_model.py
-├── server.py              # Flask server with Gemini API integration
-├── .env.example           # Template for environment variables
-├── index.html             # Web demo interface
-├── app.js                 # Web demo logic
-└── styles.css             # Web demo styling
+```text
+GEMINI_API_KEY=your_api_key_here
 ```
 
-## ✨ Key Features
+### 5. Start the application
 
-- ✅ **Fully Offline**: No internet required after setup
-- ✅ **No Deep Learning**: Simple, interpretable IsolationForest
-- ✅ **Clean Code**: Well-commented and easy to understand
-- ✅ **Demo Ready**: Works out of the box for hackathon demos
-- ✅ **Interactive Testing**: Test custom behavior patterns
+```bash
+python server.py
+```
 
-## 📝 Notes for Hackathon
+Open the local Flask URL in your browser.
 
-- The dataset is **synthetic** for demonstration purposes
-- In production, you would collect real behavioral data
-- The model can be retrained as more data becomes available
-- Parameters can be tuned for different sensitivity levels
+## Output
 
-## 🔬 Extending the Project
+The application analyzes behavioral features and predicts whether the
+submitted behavior is consistent with normal patterns or is potentially
+anomalous.
 
-Ideas for enhancement:
-- Add real-time monitoring capabilities
-- Create a web dashboard for proctors
-- Add more behavioral features (mouse movement, webcam analysis)
-- Implement ensemble methods with multiple anomaly detectors
+For anomalous results, Gemini generates a natural-language explanation
+of the detected behavioral patterns.
 
----
+## Limitations
 
-**Built for Hackathon Demo** | Python 3.10 | IsolationForest | scikit-learn
+- Uses synthetic behavioral data.
+- An anomaly does not necessarily indicate cheating.
+- Not validated on real examination data.
+- May produce false positives and false negatives.
+- Intended as a hackathon prototype, not a production system.
 
+## Future Improvements
+
+- Evaluate on real-world behavioral datasets.
+- Add real-time event collection.
+- Compare multiple anomaly detection algorithms.
+- Improve dashboard visualization.
+- Integrate with online examination platforms.
+
+## Technologies
+
+- Python
+- Scikit-learn
+- Pandas
+- NumPy
+- Flask
+- Google Gemini API
+- HTML
+- CSS
+- JavaScript
+
+## Project Context
+
+Developed collaboratively as a team project during the **IIT Palakkad Hackathon**.
