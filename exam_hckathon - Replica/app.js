@@ -20,11 +20,17 @@ const state = {
         answers: [],
         startTime: null,
         duration: 30 * 60, // 30 minutes in seconds
-        timeRemaining: 30 * 60
+        timeRemaining: 30 * 60,
+        sessionId: null,
+        sessionToken: null,
+        submissionStatus: 'not-started',
+        verificationComplete: false,
+        verificationSaveStatus: 'not-started'
     },
     proctoring: {
         warnings: 0,
         maxWarnings: 5,
+        needsManualReview: false,
         tabSwitches: 0,
         focusLosses: 0,
         pasteEvents: 0,
@@ -35,16 +41,25 @@ const state = {
     typing: {
         lastKeyTime: 0,
         keyIntervals: [],
+        examKeyIntervals: [],
+        backspaceCount: 0,
+        keystrokeCount: 0,
+        editCount: 0,
+        idleDurationsSeconds: [],
+        lastInputTime: 0,
         burstThreshold: 50, // ms - keys faster than this are burst typing
         burstCount: 0
     },
+    behaviorPrediction: { status: 'not-requested', result: null },
     audio: {
         context: null,
         analyser: null,
-        isSpeaking: false
+        isActive: false
     },
     face: {
         mesh: null,
+        faceDetected: false,
+        noFaceLogged: false,
         isLookingAway: false,
         lookAwayStart: null,
         gazeThreshold: 0.15
@@ -54,11 +69,31 @@ const state = {
         responses: []
     },
     mediaStream: null,
+    cameraStream: null,
+    microphoneStream: null,
+    animationFrame: null,
+    mediaCamera: null,
     isSetupComplete: false
 };
 
 // Exam questions container
 let examQuestions = [];
+const lifecycle = ExamLifecycle.createExamLifecycle({ onTimeout: () => {
+    addLog('⏰ Time is up!', 'danger');
+    endExam(false);
+}, onTick: (seconds) => {
+    state.exam.timeRemaining = seconds;
+    document.getElementById('time-display').textContent = formatTime(seconds);
+    if (seconds === 300) {
+        document.getElementById('timer').classList.add('warning');
+        addLog('⏰ 5 minutes remaining', 'warning');
+    }
+} });
+let questionNavigation = null;
+let verificationTimeout = null;
+let recognitionActive = false;
+let finalTranscript = '';
+let startPending = false;
 
 // Fallback questions (if API fails)
 const fallbackQuestions = [
@@ -95,7 +130,17 @@ async function fetchQuestions() {
         const response = await fetch('/api/questions');
         if (!response.ok) throw new Error('API request failed');
         
-        examQuestions = await response.json();
+        const questions = await response.json();
+        if (!Array.isArray(questions) || questions.length !== 5 || questions.some(question =>
+            !question || typeof question.text !== 'string' || !question.text.trim() || question.text.length > 2000 ||
+            typeof question.topic !== 'string' || !question.topic.trim() || question.topic.length > 100)) {
+            throw new Error('Invalid question response');
+        }
+        examQuestions = questions.map((question, index) => ({
+            id: index + 1,
+            text: question.text.trim(),
+            topic: question.topic.trim()
+        }));
         console.log('Questions loaded from API');
     } catch (err) {
         console.error('Error fetching questions:', err);
@@ -137,11 +182,12 @@ function addLog(message, type = 'info') {
     const timestamp = getTimestamp();
 
     const logEntry = document.createElement('div');
-    logEntry.className = `log-entry ${type}`;
-    logEntry.innerHTML = `
-        <span class="log-time">${timestamp}</span>
-        ${message}
-    `;
+    const safeType = ['info', 'warning', 'danger'].includes(type) ? type : 'info';
+    logEntry.className = `log-entry ${safeType}`;
+    const time = document.createElement('span');
+    time.className = 'log-time';
+    time.textContent = timestamp;
+    logEntry.append(time, document.createTextNode(String(message)));
 
     logContainer.insertBefore(logEntry, logContainer.firstChild);
 
@@ -168,12 +214,14 @@ function showWarning(title, message) {
     document.getElementById('warning-message').textContent = message;
     document.getElementById('warning-modal').classList.add('active');
 
-    // Check if max warnings reached
-    if (state.proctoring.warnings >= state.proctoring.maxWarnings) {
-        setTimeout(() => {
-            alert('Maximum warnings exceeded. Your exam will be terminated.');
-            endExam(true);
-        }, 1000);
+    // At the threshold, preserve the student's exam and flag it for human review.
+    if (!state.proctoring.needsManualReview &&
+        ExamLifecycle.shouldRecommendManualReview(state.proctoring.warnings, state.proctoring.maxWarnings)) {
+        state.proctoring.needsManualReview = true;
+        addLog('Warning threshold reached; manual review recommended.', 'warning');
+        document.getElementById('warning-title').textContent = 'Review Recommended';
+        document.getElementById('warning-message').textContent =
+            'The warning threshold was reached. Your exam will continue; this is not a finding of misconduct.';
     }
 }
 
@@ -186,27 +234,39 @@ document.getElementById('dismiss-warning')?.addEventListener('click', () => {
 // ============================================
 async function initCamera() {
     try {
-        state.mediaStream = await navigator.mediaDevices.getUserMedia({
-            video: { width: 640, height: 480, facingMode: 'user' },
-            audio: true
-        });
-
-        document.getElementById('preview-video').srcObject = state.mediaStream;
+        state.cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' } });
+        document.getElementById('preview-video').srcObject = state.cameraStream;
         document.getElementById('check-camera').classList.add('passed');
+        document.getElementById('check-camera').classList.remove('failed');
         document.getElementById('check-camera').querySelector('.check-icon').textContent = '✅';
-
-        // Setup audio monitoring
-        initAudioMonitor(state.mediaStream);
-        document.getElementById('check-mic').classList.add('passed');
-        document.getElementById('check-mic').querySelector('.check-icon').textContent = '✅';
-
+        updateStartAvailability();
         return true;
     } catch (err) {
         console.error('Camera error:', err);
         document.getElementById('check-camera').classList.add('failed');
         document.getElementById('check-camera').querySelector('.check-icon').textContent = '❌';
+        updateStartAvailability();
+        return false;
+    }
+}
+
+async function initMicrophone() {
+    try {
+        state.microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        try {
+            initAudioMonitor(state.microphoneStream);
+        } catch (err) {
+            console.error('Audio monitoring could not be initialized:', err);
+        }
+        document.getElementById('check-mic').classList.add('passed');
+        document.getElementById('check-mic').querySelector('.check-icon').textContent = '✅';
+        updateStartAvailability();
+        return true;
+    } catch (err) {
+        console.error('Microphone error:', err);
         document.getElementById('check-mic').classList.add('failed');
         document.getElementById('check-mic').querySelector('.check-icon').textContent = '❌';
+        updateStartAvailability();
         return false;
     }
 }
@@ -226,16 +286,12 @@ async function initFaceMesh() {
 
         faceMesh.onResults(onFaceResults);
         state.face.mesh = faceMesh;
-
-        document.getElementById('check-face').classList.add('passed');
-        document.getElementById('check-face').querySelector('.check-icon').textContent = '✅';
-        document.getElementById('face-status').textContent = 'Face detection ready';
-
         return true;
     } catch (err) {
         console.error('FaceMesh error:', err);
         document.getElementById('check-face').classList.add('failed');
         document.getElementById('check-face').querySelector('.check-icon').textContent = '❌';
+        updateStartAvailability();
         return false;
     }
 }
@@ -252,6 +308,14 @@ function onFaceResults(results) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        if (!state.face.faceDetected) {
+            state.face.faceDetected = true;
+            document.getElementById('check-face').classList.add('passed');
+            document.getElementById('check-face').classList.remove('failed');
+            document.getElementById('check-face').querySelector('.check-icon').textContent = '✅';
+            document.getElementById('face-status').textContent = '✅ Face detected';
+            updateStartAvailability();
+        }
         const landmarks = results.multiFaceLandmarks[0];
 
         // Draw face mesh outline
@@ -334,17 +398,25 @@ function onFaceResults(results) {
             document.getElementById('face-status').style.color = '#10b981';
         }
     } else {
+        state.face.faceDetected = false;
         if (!state.isSetupComplete) {
+            document.getElementById('check-face').classList.remove('passed');
+            document.getElementById('check-face').querySelector('.check-icon').textContent = '⏳';
             document.getElementById('face-status').textContent = '⚠️ No face detected';
             document.getElementById('face-status').style.color = '#f59e0b';
-        } else {
-            // Face not detected during exam
+            updateStartAvailability();
+        } else if (!state.face.noFaceLogged) {
+            state.face.noFaceLogged = true;
             addLog('Face not detected in frame', 'warning');
         }
     }
+
+    if (results.multiFaceLandmarks?.length) state.face.noFaceLogged = false;
 }
 
 async function startFaceDetection(video) {
+    if (!state.face.mesh || !video || !state.cameraStream) return false;
+    if (state.mediaCamera) return true;
     const camera = new Camera(video, {
         onFrame: async () => {
             if (state.face.mesh) {
@@ -354,13 +426,28 @@ async function startFaceDetection(video) {
         width: 640,
         height: 480
     });
-    camera.start();
+    state.mediaCamera = camera;
+    state.face.video = video;
+    try {
+        await camera.start();
+        return true;
+    } catch (err) {
+        console.error('Camera frame loop error:', err);
+        try { camera.stop(); } catch (_) { /* camera loop was not started */ }
+        state.mediaCamera = null;
+        document.getElementById('check-face').classList.remove('passed');
+        document.getElementById('check-face').classList.add('failed');
+        document.getElementById('check-face').querySelector('.check-icon').textContent = '❌';
+        updateStartAvailability();
+        return false;
+    }
 }
 
 // ============================================
 // AUDIO MONITORING
 // ============================================
 function initAudioMonitor(stream) {
+    if (!stream || state.audio.context) return;
     state.audio.context = new (window.AudioContext || window.webkitAudioContext)();
     state.audio.analyser = state.audio.context.createAnalyser();
 
@@ -370,10 +457,12 @@ function initAudioMonitor(stream) {
     state.audio.analyser.fftSize = 256;
     const bufferLength = state.audio.analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
+    state.audio.running = true;
 
     function updateAudioVisualizer() {
+        if (!state.audio.running) return;
         if (!state.isSetupComplete) {
-            requestAnimationFrame(updateAudioVisualizer);
+            state.animationFrame = requestAnimationFrame(updateAudioVisualizer);
             return;
         }
 
@@ -393,24 +482,23 @@ function initAudioMonitor(stream) {
             bar.style.height = `${5 + value * 35}px`;
         });
 
-        // Detect speaking
+        // Volume can show audio activity, but cannot reliably identify speech.
         const audioStatus = document.getElementById('audio-status');
         if (average > 30) {
-            if (!state.audio.isSpeaking) {
-                state.audio.isSpeaking = true;
-                audioStatus.textContent = 'Speaking Detected';
-                audioStatus.classList.add('speaking');
-                addLog('🎤 Speaking detected', 'warning');
+            if (!state.audio.isActive) {
+                state.audio.isActive = true;
+                audioStatus.textContent = 'Audio Activity';
+                audioStatus.classList.add('active');
             }
         } else {
-            if (state.audio.isSpeaking) {
-                state.audio.isSpeaking = false;
+            if (state.audio.isActive) {
+                state.audio.isActive = false;
                 audioStatus.textContent = 'Silent';
-                audioStatus.classList.remove('speaking');
+                audioStatus.classList.remove('active');
             }
         }
 
-        requestAnimationFrame(updateAudioVisualizer);
+        state.animationFrame = requestAnimationFrame(updateAudioVisualizer);
     }
 
     updateAudioVisualizer();
@@ -421,6 +509,28 @@ function initAudioMonitor(stream) {
 // ============================================
 let fullscreenWarningShown = false;
 
+function fullscreenSupported() {
+    const root = document.documentElement;
+    const apiAvailable = !!(root.requestFullscreen || root.webkitRequestFullscreen || root.msRequestFullscreen);
+    if (!apiAvailable) return false;
+    const reportedCapabilities = [document.fullscreenEnabled, document.webkitFullscreenEnabled, document.msFullscreenEnabled]
+        .filter(value => typeof value === 'boolean');
+    if (reportedCapabilities.length) return reportedCapabilities.some(Boolean);
+    return true;
+}
+
+function fullscreenActive() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement);
+}
+
+function updateStartAvailability() {
+    const name = document.getElementById('student-name')?.value.trim();
+    const id = document.getElementById('student-id')?.value.trim();
+    const ready = name && id && state.cameraStream && state.microphoneStream && state.face.faceDetected && fullscreenSupported();
+    const button = document.getElementById('start-exam-btn');
+    if (button) button.disabled = !ready;
+}
+
 async function requestFullscreen() {
     try {
         if (document.documentElement.requestFullscreen) {
@@ -429,9 +539,10 @@ async function requestFullscreen() {
             await document.documentElement.webkitRequestFullscreen();
         } else if (document.documentElement.msRequestFullscreen) {
             await document.documentElement.msRequestFullscreen();
+        } else {
+            return false;
         }
-        document.getElementById('check-fullscreen').classList.add('passed');
-        document.getElementById('check-fullscreen').querySelector('.check-icon').textContent = '✅';
+        if (!fullscreenActive()) return false;
         fullscreenWarningShown = false;
         return true;
     } catch (err) {
@@ -443,7 +554,7 @@ async function requestFullscreen() {
 }
 
 document.addEventListener('fullscreenchange', () => {
-    if (state.isSetupComplete && !document.fullscreenElement && !fullscreenWarningShown) {
+    if (lifecycle.status === 'active' && !fullscreenActive() && !fullscreenWarningShown) {
         fullscreenWarningShown = true;
         state.proctoring.focusLosses++;
         document.getElementById('stat-focus').textContent = state.proctoring.focusLosses;
@@ -452,14 +563,30 @@ document.addEventListener('fullscreenchange', () => {
 
         // Try to re-enter fullscreen after a delay
         setTimeout(() => {
-            requestFullscreen();
+            if (lifecycle.status === 'active') requestFullscreen();
         }, 1000);
+    } else if (fullscreenActive()) fullscreenWarningShown = false;
+});
+document.addEventListener('webkitfullscreenchange', () => {
+    if (lifecycle.status === 'active' && !fullscreenActive() && !fullscreenWarningShown) {
+        fullscreenWarningShown = true;
+        state.proctoring.focusLosses++;
+        document.getElementById('stat-focus').textContent = state.proctoring.focusLosses;
+        showWarning('Fullscreen Exit!', 'You exited fullscreen mode. Please stay in fullscreen during the exam.');
     }
+});
+document.addEventListener('MSFullscreenChange', () => {
+    if (lifecycle.status === 'active' && !fullscreenActive() && !fullscreenWarningShown) {
+        fullscreenWarningShown = true;
+        state.proctoring.focusLosses++;
+        document.getElementById('stat-focus').textContent = state.proctoring.focusLosses;
+        showWarning('Fullscreen Exit!', 'You exited fullscreen mode. Please stay in fullscreen during the exam.');
+    } else if (fullscreenActive()) fullscreenWarningShown = false;
 });
 
 // Keyboard shortcut to re-enter fullscreen
 document.addEventListener('keydown', (e) => {
-    if (state.isSetupComplete && e.key === 'F11') {
+    if (lifecycle.status === 'active' && e.key === 'F11') {
         e.preventDefault();
         requestFullscreen();
     }
@@ -495,12 +622,19 @@ function showTabSwitchOverlay() {
             text-align: center;
             animation: fadeIn 0.3s ease;
         `;
-        overlay.innerHTML = `
-            <div style="font-size: 80px; margin-bottom: 20px;">⚠️</div>
-            <h1 style="margin-bottom: 10px;">TAB SWITCH DETECTED!</h1>
-            <p style="font-size: 18px; opacity: 0.9;">This violation has been recorded.</p>
-            <p style="font-size: 16px; margin-top: 20px; opacity: 0.7;">Click anywhere to dismiss</p>
-        `;
+        const icon = document.createElement('div');
+        icon.style.cssText = 'font-size:80px;margin-bottom:20px';
+        icon.textContent = '⚠️';
+        const heading = document.createElement('h1');
+        heading.style.marginBottom = '10px';
+        heading.textContent = 'TAB SWITCH DETECTED!';
+        const notice = document.createElement('p');
+        notice.style.cssText = 'font-size:18px;opacity:0.9';
+        notice.textContent = 'This violation has been recorded.';
+        const dismiss = document.createElement('p');
+        dismiss.style.cssText = 'font-size:16px;margin-top:20px;opacity:0.7';
+        dismiss.textContent = 'Click anywhere to dismiss';
+        overlay.replaceChildren(icon, heading, notice, dismiss);
         overlay.onclick = () => {
             overlay.remove();
         };
@@ -621,10 +755,8 @@ document.addEventListener('paste', (e) => {
     if (state.isSetupComplete) {
         state.proctoring.pasteEvents++;
         document.getElementById('stat-paste').textContent = state.proctoring.pasteEvents;
-
-        const clipboardData = e.clipboardData.getData('text');
-        const preview = clipboardData.substring(0, 50);
-        addLog(`📋 Paste detected: "${preview}${clipboardData.length > 50 ? '...' : ''}"`, 'danger');
+        // Never read or log clipboard contents; record only the event count.
+        addLog('Paste event detected', 'danger');
 
         if (state.proctoring.pasteEvents >= 2) {
             showWarning('Paste Detected', 'Multiple paste operations detected. This is flagged as suspicious behavior.');
@@ -647,27 +779,37 @@ function initKeystrokeAnalysis() {
     const answerInput = document.getElementById('answer-input');
 
     answerInput.addEventListener('keydown', (e) => {
+        if (e.ctrlKey || e.metaKey || e.altKey || (e.key.length !== 1 && !['Backspace', 'Delete'].includes(e.key))) return;
         const now = Date.now();
+        const questionIndex = state.exam.currentQuestion;
+        if (state.exam.firstKeyDelaysMs[questionIndex] === null) {
+            state.exam.firstKeyDelaysMs[questionIndex] = Math.max(0, now - state.exam.questionStartedAt);
+        }
+        state.typing.keystrokeCount++;
+        if (e.key === 'Backspace') state.typing.backspaceCount++;
+        if (e.key === 'Backspace' || e.key === 'Delete') {
+            state.typing.editCount++;
+        }
+        if (e.key.length !== 1) return;
 
         if (state.typing.lastKeyTime > 0) {
             const interval = now - state.typing.lastKeyTime;
-            state.typing.keyIntervals.push(interval);
+            if (interval > 0 && interval < 10000) {
+                state.typing.keyIntervals.push(interval);
+                state.typing.examKeyIntervals.push(interval);
+                updateBehaviorBaseline(interval);
 
-            // Feed to behavioral learning system
-            updateBehaviorBaseline(interval);
-
-            // Detect burst typing (suspiciously fast, like pasting or scripted input)
-            if (interval < state.typing.burstThreshold) {
-                state.typing.burstCount++;
-
-                if (state.typing.burstCount >= 10) {
-                    state.proctoring.typingBursts++;
-                    document.getElementById('stat-bursts').textContent = state.proctoring.typingBursts;
-                    addLog('⚡ Burst typing detected (suspiciously fast)', 'warning');
-                    state.typing.burstCount = 0;
+                if (interval < state.typing.burstThreshold) {
+                    state.typing.burstCount++;
+                    if (state.typing.burstCount >= 10) {
+                        state.proctoring.typingBursts++;
+                        document.getElementById('stat-bursts').textContent = state.proctoring.typingBursts;
+                        addLog('⚡ Burst typing detected (suspiciously fast)', 'warning');
+                        state.typing.burstCount = 0;
+                    }
+                } else {
+                    state.typing.burstCount = Math.max(0, state.typing.burstCount - 1);
                 }
-            } else {
-                state.typing.burstCount = Math.max(0, state.typing.burstCount - 1);
             }
         }
 
@@ -677,14 +819,17 @@ function initKeystrokeAnalysis() {
     // Update typing stats display
     answerInput.addEventListener('input', () => {
         const text = answerInput.value;
+        const now = Date.now();
+        if (state.typing.lastInputTime > 0) {
+            const idleSeconds = (now - state.typing.lastInputTime) / 1000;
+            if (idleSeconds >= 2) state.typing.idleDurationsSeconds.push(idleSeconds);
+        }
+        state.typing.lastInputTime = now;
         document.getElementById('char-count').textContent = `${text.length} characters`;
 
         // Calculate WPM
-        if (state.typing.keyIntervals.length > 10) {
-            const avgInterval = state.typing.keyIntervals.slice(-20).reduce((a, b) => a + b, 0) / 20;
-            const wpm = Math.round((60000 / avgInterval) / 5); // Assuming 5 chars per word
-            document.getElementById('typing-speed').textContent = `${Math.min(wpm, 200)} WPM`;
-        }
+        const wpm = ExamLifecycle.calculateWpm(state.typing.keyIntervals);
+        document.getElementById('typing-speed').textContent = `${Math.min(wpm, 200)} WPM`;
     });
 }
 
@@ -693,20 +838,28 @@ function initKeystrokeAnalysis() {
 // ============================================
 function loadQuestion(index) {
     const question = examQuestions[index];
+    if (!question) return;
+    state.typing.lastKeyTime = 0;
+    state.typing.keyIntervals = [];
+    state.exam.questionStartedAt = Date.now();
     const questionCard = document.getElementById('question-card');
-
-    questionCard.innerHTML = `
-        <h3>Topic: ${question.topic}</h3>
-        <p>${question.text}</p>
-    `;
+    questionCard.replaceChildren();
+    const topic = document.createElement('h3');
+    topic.textContent = `Topic: ${question.topic}`;
+    const text = document.createElement('p');
+    text.textContent = question.text;
+    questionCard.append(topic, text);
 
     // Load saved answer
-    document.getElementById('answer-input').value = state.exam.answers[index] || '';
+    const answerInput = document.getElementById('answer-input');
+    answerInput.value = state.exam.answers[index] || '';
+    document.getElementById('char-count').textContent = `${answerInput.value.length} characters`;
+    document.getElementById('typing-speed').textContent = '0 WPM';
 
     // Update navigation
     document.getElementById('current-q').textContent = index + 1;
     document.getElementById('prev-btn').disabled = index === 0;
-    document.getElementById('next-btn').textContent = index === examQuestions.length - 1 ? 'Review' : 'Next →';
+    document.getElementById('next-btn').textContent = index === examQuestions.length - 1 ? 'Review answers →' : 'Next →';
 
     // Update indicators
     updateQuestionIndicators();
@@ -716,7 +869,7 @@ function loadQuestion(index) {
 
 function updateQuestionIndicators() {
     const container = document.getElementById('q-indicators');
-    container.innerHTML = '';
+    container.replaceChildren();
 
     examQuestions.forEach((q, i) => {
         const indicator = document.createElement('div');
@@ -726,6 +879,7 @@ function updateQuestionIndicators() {
         indicator.textContent = i + 1;
         indicator.onclick = () => {
             saveCurrentAnswer();
+            questionNavigation.goTo(i);
             state.exam.currentQuestion = i;
             loadQuestion(i);
         };
@@ -735,40 +889,54 @@ function updateQuestionIndicators() {
 
 function saveCurrentAnswer() {
     const answer = document.getElementById('answer-input').value;
-    state.exam.answers[state.exam.currentQuestion] = answer;
+    const index = state.exam.currentQuestion;
+    state.exam.answers[index] = answer;
+    if (state.exam.questionStartedAt !== null) {
+        state.exam.questionDurationsMs[index] += Math.max(0, Date.now() - state.exam.questionStartedAt);
+        state.exam.questionStartedAt = null;
+    }
+}
+
+function openReview() {
+    saveCurrentAnswer();
+    const list = document.getElementById('review-question-list');
+    list.replaceChildren();
+    examQuestions.forEach((question, index) => {
+        const row = document.createElement('div');
+        row.className = 'review-question-row';
+        const details = document.createElement('div');
+        const heading = document.createElement('strong');
+        heading.textContent = `Question ${index + 1}: ${question.topic}`;
+        const prompt = document.createElement('p');
+        prompt.textContent = question.text;
+        const answerText = document.createElement('p');
+        const answer = state.exam.answers[index] || '';
+        answerText.textContent = `Your answer: ${answer.trim() || 'Not answered'}`;
+        details.append(heading, prompt, answerText);
+        const jump = document.createElement('button');
+        jump.type = 'button';
+        jump.className = 'nav-btn';
+        jump.textContent = 'Review answer';
+        jump.addEventListener('click', () => {
+            state.exam.currentQuestion = index;
+            questionNavigation.goTo(index);
+            loadQuestion(index);
+            showScreen('exam-screen');
+        });
+        row.append(details, jump);
+        list.appendChild(row);
+    });
+    showScreen('review-screen');
 }
 
 // ============================================
 // TIMER
 // ============================================
-function startTimer() {
-    const timerDisplay = document.getElementById('time-display');
-    const timerElement = document.getElementById('timer');
-
-    const timerInterval = setInterval(() => {
-        state.exam.timeRemaining--;
-        timerDisplay.textContent = formatTime(state.exam.timeRemaining);
-
-        // Warning when time is low
-        if (state.exam.timeRemaining === 300) { // 5 minutes
-            timerElement.classList.add('warning');
-            addLog('⏰ 5 minutes remaining', 'warning');
-        }
-
-        if (state.exam.timeRemaining <= 0) {
-            clearInterval(timerInterval);
-            addLog('⏰ Time is up!', 'danger');
-            endExam(false);
-        }
-    }, 1000);
-
-    return timerInterval;
-}
-
 // ============================================
 // EXAM FLOW
 // ============================================
 async function startExam() {
+    if (startPending || lifecycle.status !== 'setup') return;
     const name = document.getElementById('student-name').value.trim();
     const id = document.getElementById('student-id').value.trim();
 
@@ -780,16 +948,52 @@ async function startExam() {
     state.student.name = name;
     state.student.id = id;
 
-    // Request fullscreen
-    await requestFullscreen();
+    if (lifecycle.status !== 'setup') return;
+    if (!state.cameraStream || !state.microphoneStream || !state.face.faceDetected) {
+        alert('Camera, microphone, and face detection must be ready before starting.');
+        return;
+    }
+    startPending = true;
+    if (!fullscreenSupported() || !(fullscreenActive() || await requestFullscreen()) || !fullscreenActive()) {
+        startPending = false;
+        alert('Fullscreen mode is required to start the exam.');
+        return;
+    }
+
+    try {
+        const sessionResponse = await fetch('/api/exam-sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ student_name: name, student_id: id, question_count: examQuestions.length })
+        });
+        const session = await sessionResponse.json().catch(() => ({}));
+        if (!sessionResponse.ok) throw new Error(session.message || 'Could not create a secure exam session');
+        state.exam.sessionId = session.session_id;
+        state.exam.sessionToken = session.session_token;
+
+        const startResponse = await fetch(`/api/exam-sessions/${encodeURIComponent(session.session_id)}/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.session_token}` },
+            body: '{}'
+        });
+        if (!startResponse.ok) throw new Error('Could not activate the secure exam session');
+    } catch (err) {
+        startPending = false;
+        state.exam.sessionId = null;
+        state.exam.sessionToken = null;
+        console.error('Secure exam session could not start:', err.message);
+        alert('The exam could not be started securely. Check the server connection and try again.');
+        return;
+    }
 
     // Setup exam screen
     state.isSetupComplete = true;
+    startPending = false;
+    if (state.audio.context?.state === 'suspended') state.audio.context.resume();
     showScreen('exam-screen');
 
     // Setup video for exam
-    document.getElementById('exam-video').srcObject = state.mediaStream;
-    startFaceDetection(document.getElementById('exam-video'));
+    document.getElementById('exam-video').srcObject = state.cameraStream;
 
     // Display student info
     document.getElementById('student-display').textContent = `${name} (${id})`;
@@ -797,19 +1001,38 @@ async function startExam() {
     // Initialize
     document.getElementById('total-q').textContent = examQuestions.length;
     state.exam.answers = new Array(examQuestions.length).fill('');
+    state.exam.submissionStatus = 'not-started';
+    state.exam.verificationComplete = false;
+    state.exam.verificationSaveStatus = 'not-started';
+    state.exam.questionDurationsMs = new Array(examQuestions.length).fill(0);
+    state.exam.firstKeyDelaysMs = new Array(examQuestions.length).fill(null);
+    state.exam.questionStartedAt = null;
+    state.typing.lastKeyTime = 0;
+    state.typing.keyIntervals = [];
+    state.typing.examKeyIntervals = [];
+    state.typing.backspaceCount = 0;
+    state.typing.keystrokeCount = 0;
+    state.typing.editCount = 0;
+    state.typing.idleDurationsSeconds = [];
+    state.typing.lastInputTime = 0;
+    state.behaviorPrediction = { status: 'not-requested', result: null };
+    questionNavigation = ExamLifecycle.createQuestionNavigation(examQuestions.length);
     loadQuestion(0);
     initKeystrokeAnalysis();
 
     // Start timer
     state.exam.startTime = Date.now();
-    startTimer();
+    lifecycle.start(state.exam.duration);
 
     addLog('Exam started', 'info');
-    addLog(`Student: ${name} (${id})`, 'info');
 }
 
 function endExam(terminated = false) {
+    if (!lifecycle.submit()) return false;
     saveCurrentAnswer();
+    state.verification.responses = new Array(verificationQuestions.length).fill('');
+    submitExamSession();
+    requestBehaviorPrediction();
 
     if (terminated) {
         addLog('Exam terminated due to violations', 'danger');
@@ -819,6 +1042,152 @@ function endExam(terminated = false) {
 
     // Go to verification or results
     startVerification();
+    return true;
+}
+
+async function submitExamSession() {
+    if (state.exam.submissionStatus === 'pending' || state.exam.submissionStatus === 'saved') return;
+    if (!state.exam.sessionId || !state.exam.sessionToken) {
+        state.exam.submissionStatus = 'failed';
+        renderExamSubmissionStatus();
+        return;
+    }
+    state.exam.submissionStatus = 'pending';
+    renderExamSubmissionStatus();
+    const payload = {
+        answers: [...state.exam.answers],
+        proctoring: {
+            warnings: state.proctoring.warnings,
+            tab_switches: state.proctoring.tabSwitches,
+            focus_losses: state.proctoring.focusLosses,
+            paste_events: state.proctoring.pasteEvents,
+            gaze_away: state.proctoring.gazeAway,
+            typing_bursts: state.proctoring.typingBursts,
+            manual_review_recommended: state.proctoring.needsManualReview
+        },
+        verification_responses: [...state.verification.responses]
+    };
+    try {
+        const response = await fetch(`/api/exam-sessions/${encodeURIComponent(state.exam.sessionId)}/submit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.exam.sessionToken}` },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) throw new Error('submission_failed');
+        state.exam.submissionStatus = 'saved';
+        if (state.exam.verificationComplete) saveVerificationResponses();
+    } catch (err) {
+        console.error('Secure exam submission failed. Student data was not logged.', err.message);
+        state.exam.submissionStatus = 'failed';
+    }
+    renderExamSubmissionStatus();
+}
+
+async function saveVerificationResponses() {
+    if (state.exam.verificationSaveStatus === 'pending' || state.exam.verificationSaveStatus === 'saved') return;
+    if (state.exam.submissionStatus !== 'saved' || !state.exam.sessionId || !state.exam.sessionToken) return;
+    state.exam.verificationSaveStatus = 'pending';
+    renderExamSubmissionStatus();
+    try {
+        const response = await fetch(`/api/exam-sessions/${encodeURIComponent(state.exam.sessionId)}/verification`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.exam.sessionToken}` },
+            body: JSON.stringify({ verification_responses: [...state.verification.responses] })
+        });
+        if (!response.ok) throw new Error('verification_save_failed');
+        state.exam.verificationSaveStatus = 'saved';
+        state.exam.sessionToken = null;
+    } catch (err) {
+        console.error('Oral verification could not be saved.', err.message);
+        state.exam.verificationSaveStatus = 'failed';
+    }
+    renderExamSubmissionStatus();
+}
+
+function renderExamSubmissionStatus() {
+    const status = document.getElementById('exam-submission-status');
+    const retry = document.getElementById('retry-exam-submit-btn');
+    if (!status || !retry) return;
+    if (state.exam.submissionStatus === 'pending') {
+        status.textContent = 'Saving your exam securely…';
+        retry.hidden = true;
+    } else if (state.exam.submissionStatus === 'failed') {
+        status.textContent = 'The server has not confirmed saving this exam. Retry when the connection is available.';
+        retry.hidden = false;
+    } else if (state.exam.submissionStatus === 'saved' && !state.exam.verificationComplete) {
+        status.textContent = 'Exam answers saved securely. Oral verification is still in progress.';
+        retry.hidden = true;
+    } else if (state.exam.submissionStatus === 'saved' && state.exam.verificationSaveStatus === 'pending') {
+        status.textContent = 'Saving oral verification securely…';
+        retry.hidden = true;
+    } else if (state.exam.submissionStatus === 'saved' && state.exam.verificationSaveStatus === 'failed') {
+        status.textContent = 'Exam saved, but oral verification was not confirmed. Retry when the connection is available.';
+        retry.hidden = false;
+    } else if (state.exam.submissionStatus === 'saved' && state.exam.verificationSaveStatus === 'saved') {
+        status.textContent = 'Your exam submission was saved.';
+        retry.hidden = true;
+    } else {
+        status.textContent = 'Waiting for secure exam submission.';
+        retry.hidden = true;
+    }
+}
+
+function collectBehaviorFeatures() {
+    return ExamLifecycle.calculateBehaviorFeatures({
+        keyIntervalsMs: state.typing.examKeyIntervals,
+        backspaceCount: state.typing.backspaceCount,
+        keystrokeCount: state.typing.keystrokeCount,
+        pasteCount: state.proctoring.pasteEvents,
+        tabSwitches: state.proctoring.tabSwitches,
+        focusLosses: state.proctoring.focusLosses,
+        idleDurationsSeconds: state.typing.idleDurationsSeconds,
+        editCount: state.typing.editCount,
+        firstKeyDelaysSeconds: state.exam.firstKeyDelaysMs.filter(value => value !== null).map(value => value / 1000),
+        questionCount: state.exam.answers.length || 1,
+        answerDurationSeconds: state.exam.questionDurationsMs.reduce((sum, value) => sum + value, 0) / 1000
+    });
+}
+
+async function requestBehaviorPrediction() {
+    if (state.behaviorPrediction.status !== 'not-requested') return;
+    state.behaviorPrediction = { status: 'pending', result: null };
+    renderBehaviorPrediction();
+    try {
+        const response = await fetch('/api/predict', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ features: collectBehaviorFeatures() })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || 'prediction_unavailable');
+        state.behaviorPrediction = { status: 'ready', result: body };
+    } catch (error) {
+        console.warn('Behavior model prediction unavailable:', error.message);
+        state.behaviorPrediction = { status: 'unavailable', result: null };
+    }
+    renderBehaviorPrediction();
+}
+
+function renderBehaviorPrediction() {
+    const container = document.getElementById('ml-prediction-summary');
+    if (!container) return;
+    container.replaceChildren();
+    const status = state.behaviorPrediction.status;
+    const message = document.createElement('p');
+    if (status === 'pending') {
+        message.textContent = 'Evaluating the aggregate behavior summary…';
+    } else if (status !== 'ready') {
+        message.textContent = 'Model result unavailable. The existing proctoring summary remains available.';
+    } else {
+        const result = state.behaviorPrediction.result;
+        message.textContent = result.alert_category === 'review'
+            ? 'The model flagged this summary for human review. This is not proof of cheating.'
+            : 'The model did not flag this summary.';
+        const score = document.createElement('p');
+        score.textContent = `Isolation Forest decision score: ${result.decision_score} (lower values are more anomalous).`;
+        container.appendChild(score);
+    }
+    container.prepend(message);
 }
 
 // ============================================
@@ -828,9 +1197,9 @@ let recognition = null;
 
 function startVerification() {
     showScreen('verification-screen');
-
-    document.getElementById('verification-video').srcObject = state.mediaStream;
-    startFaceDetection(document.getElementById('verification-video'));
+    document.getElementById('verification-video').srcObject = state.cameraStream;
+    state.verification.currentQuestion = 0;
+    state.verification.responses = new Array(verificationQuestions.length).fill('');
 
     // Setup speech recognition
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
@@ -841,60 +1210,105 @@ function startVerification() {
         recognition.lang = 'en-US';
 
         recognition.onresult = (event) => {
-            let transcript = '';
+            let interimTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; i++) {
-                transcript += event.results[i][0].transcript;
+                const result = event.results[i];
+                if (result.isFinal) finalTranscript += result[0].transcript.trim() + ' ';
+                else interimTranscript += result[0].transcript;
             }
-            document.getElementById('transcript-output').textContent = transcript;
+            state.verification.responses[state.verification.currentQuestion] = finalTranscript.trim();
+            document.getElementById('transcript-output').textContent = `${finalTranscript}${interimTranscript}`.trim();
         };
 
         recognition.onerror = (event) => {
             console.error('Speech recognition error:', event.error);
+            if (event.error !== 'aborted') {
+                document.getElementById('transcript-output').textContent = event.error === 'not-allowed'
+                    ? 'Microphone permission was denied. You can try again or continue.'
+                    : `Speech recognition error: ${event.error}. You can try again or continue.`;
+            }
+            if (recognitionActive) {
+                try { recognition.stop(); } catch (_) { /* onend will complete the attempt */ }
+            }
         };
+        recognition.onend = finishRecognition;
+    } else {
+        alert('Speech recognition is not supported. Skipping verification.');
+        showResults();
+        return;
     }
 
     loadVerificationQuestion(0);
 }
 
 function loadVerificationQuestion(index) {
+    if (index < 0 || index >= verificationQuestions.length) return;
     const container = document.getElementById('verification-question');
     container.querySelector('.v-question-number').textContent =
         `Question ${index + 1} of ${verificationQuestions.length}`;
     document.getElementById('v-question-text').textContent = verificationQuestions[index];
 
     // Reset UI
-    document.getElementById('transcript-output').textContent = 'Click "Start Speaking" to begin...';
+    finalTranscript = state.verification.responses[index] || '';
+    document.getElementById('transcript-output').textContent = finalTranscript || 'Click "Start Speaking" to begin...';
     document.getElementById('recording-status').classList.remove('active');
     document.getElementById('start-speaking').style.display = 'flex';
     document.getElementById('next-v-question').style.display = 'none';
     document.getElementById('complete-verification').style.display = 'none';
+    if (!recognition && index === verificationQuestions.length - 1) document.getElementById('complete-verification').style.display = 'block';
+}
+
+function finishRecognition() {
+    if (!recognitionActive) return;
+    recognitionActive = false;
+    if (verificationTimeout !== null) clearTimeout(verificationTimeout);
+    verificationTimeout = null;
+    const transcript = finalTranscript.trim();
+    state.verification.responses[state.verification.currentQuestion] = transcript;
+    document.getElementById('recording-status').classList.remove('active');
+    if (!transcript) {
+        document.getElementById('start-speaking').style.display = 'flex';
+        document.getElementById('transcript-output').textContent = 'No speech captured. You can try again or continue.';
+        if (state.verification.currentQuestion < verificationQuestions.length - 1) {
+            document.getElementById('next-v-question').style.display = 'block';
+        } else {
+            document.getElementById('complete-verification').style.display = 'block';
+        }
+        return;
+    }
+    document.getElementById('transcript-output').textContent = transcript;
+    document.getElementById('start-speaking').style.display = 'none';
+    if (state.verification.currentQuestion < verificationQuestions.length - 1) {
+        document.getElementById('next-v-question').style.display = 'block';
+    } else {
+        document.getElementById('complete-verification').style.display = 'block';
+    }
+}
+
+function stopRecognition() {
+    if (verificationTimeout !== null) clearTimeout(verificationTimeout);
+    verificationTimeout = null;
+    if (recognition && recognitionActive) {
+        try { recognition.stop(); } catch (err) { console.warn('Speech recognition stop failed:', err); }
+    }
 }
 
 document.getElementById('start-speaking')?.addEventListener('click', () => {
-    if (recognition) {
-        recognition.start();
+    if (recognition && !recognitionActive) {
+        finalTranscript = '';
+        state.verification.responses[state.verification.currentQuestion] = '';
+        try {
+            recognition.start();
+            recognitionActive = true;
+        } catch (err) {
+            console.error('Speech recognition start failed:', err);
+            document.getElementById('transcript-output').textContent = 'Could not start speech recognition. Please try again.';
+            return;
+        }
         document.getElementById('recording-status').classList.add('active');
         document.getElementById('start-speaking').style.display = 'none';
         document.getElementById('transcript-output').textContent = 'Listening...';
-
-        // Stop after 30 seconds
-        setTimeout(() => {
-            recognition.stop();
-            document.getElementById('recording-status').classList.remove('active');
-
-            const transcript = document.getElementById('transcript-output').textContent;
-            state.verification.responses[state.verification.currentQuestion] = transcript;
-
-            // Show next button
-            if (state.verification.currentQuestion < verificationQuestions.length - 1) {
-                document.getElementById('next-v-question').style.display = 'block';
-            } else {
-                document.getElementById('complete-verification').style.display = 'block';
-            }
-        }, 30000);
-    } else {
-        alert('Speech recognition not supported. Skipping verification.');
-        showResults();
+        verificationTimeout = setTimeout(stopRecognition, 30000);
     }
 });
 
@@ -904,24 +1318,65 @@ document.getElementById('next-v-question')?.addEventListener('click', () => {
 });
 
 document.getElementById('complete-verification')?.addEventListener('click', () => {
-    if (recognition) recognition.stop();
+    stopRecognition();
     showResults();
 });
+
+function cleanupSessionResources() {
+    state.isSetupComplete = false;
+    stopRecognition();
+    if (recognition) {
+        recognition.onend = null;
+        recognition.onerror = null;
+        recognition.onresult = null;
+        recognition = null;
+    }
+    recognitionActive = false;
+    lifecycle.complete();
+    lifecycle.dispose();
+    state.audio.running = false;
+    if (state.animationFrame !== null) cancelAnimationFrame(state.animationFrame);
+    state.animationFrame = null;
+    if (state.mediaCamera) {
+        try { state.mediaCamera.stop(); } catch (err) { console.warn('Camera loop stop failed:', err); }
+        state.mediaCamera = null;
+    }
+    [state.cameraStream, state.microphoneStream].filter(Boolean).forEach(stream => {
+        stream.getTracks().forEach(track => track.stop());
+    });
+    state.cameraStream = null;
+    state.microphoneStream = null;
+    if (state.audio.context && state.audio.context.state !== 'closed') {
+        state.audio.context.close().catch(err => console.warn('Audio context close failed:', err));
+    }
+    state.audio.context = null;
+    state.audio.analyser = null;
+    if (state.face.mesh && state.face.mesh.close) {
+        try {
+            const closing = state.face.mesh.close();
+            closing?.catch(err => console.warn('Face Mesh close failed:', err));
+        } catch (err) {
+            console.warn('Face Mesh close failed:', err);
+        }
+    }
+    state.face.mesh = null;
+    document.querySelectorAll('video').forEach(video => { video.srcObject = null; });
+}
 
 // ============================================
 // RESULTS
 // ============================================
 function showResults() {
+    if (lifecycle.status === 'completed') return;
+    state.exam.verificationComplete = true;
+    if (state.exam.submissionStatus === 'saved') saveVerificationResponses();
+    else submitExamSession();
+    cleanupSessionResources();
     showScreen('results-screen');
 
-    // Stop media
-    if (state.mediaStream) {
-        state.mediaStream.getTracks().forEach(track => track.stop());
-    }
-
     // Exit fullscreen
-    if (document.fullscreenElement) {
-        document.exitFullscreen();
+    if (fullscreenActive()) {
+        (document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen)?.call(document);
     }
 
     // Calculate integrity score
@@ -934,32 +1389,27 @@ function showResults() {
 
     // Update summary
     const summaryGrid = document.getElementById('summary-grid');
-    summaryGrid.innerHTML = `
-        <div class="summary-item">
-            <div class="value">${state.proctoring.tabSwitches}</div>
-            <div class="label">Tab Switches</div>
-        </div>
-        <div class="summary-item">
-            <div class="value">${state.proctoring.focusLosses}</div>
-            <div class="label">Focus Lost</div>
-        </div>
-        <div class="summary-item">
-            <div class="value">${state.proctoring.pasteEvents}</div>
-            <div class="label">Paste Events</div>
-        </div>
-        <div class="summary-item">
-            <div class="value">${state.proctoring.gazeAway}</div>
-            <div class="label">Gaze Warnings</div>
-        </div>
-        <div class="summary-item">
-            <div class="value">${state.proctoring.typingBursts}</div>
-            <div class="label">Typing Bursts</div>
-        </div>
-        <div class="summary-item">
-            <div class="value">${state.proctoring.warnings}</div>
-            <div class="label">Total Warnings</div>
-        </div>
-    `;
+    const stats = [
+        ['Tab Switches', state.proctoring.tabSwitches],
+        ['Focus Lost', state.proctoring.focusLosses],
+        ['Paste Events', state.proctoring.pasteEvents],
+        ['Gaze Warnings', state.proctoring.gazeAway],
+        ['Typing Bursts', state.proctoring.typingBursts],
+        ['Total Warnings', state.proctoring.warnings],
+        ['Manual Review', state.proctoring.needsManualReview ? 'Recommended' : 'Not flagged']
+    ];
+    summaryGrid.replaceChildren(...stats.map(([label, value]) => {
+        const item = document.createElement('div');
+        item.className = 'summary-item';
+        const number = document.createElement('div');
+        number.className = 'value';
+        number.textContent = String(value);
+        const caption = document.createElement('div');
+        caption.className = 'label';
+        caption.textContent = label;
+        item.append(number, caption);
+        return item;
+    }));
 
     // Update score
     const scoreCircle = document.getElementById('score-circle');
@@ -978,19 +1428,45 @@ function showResults() {
 
     // Warning log
     const warningLogDiv = document.getElementById('warning-log-summary');
-    if (state.proctoring.logs.filter(l => l.type !== 'info').length > 0) {
-        warningLogDiv.innerHTML = state.proctoring.logs
-            .filter(l => l.type !== 'info')
-            .slice(0, 10)
-            .map(l => `<div class="warning-log-item"><span>${l.message}</span><span>${l.time}</span></div>`)
-            .join('');
+    warningLogDiv.replaceChildren();
+    const warningLogs = state.proctoring.logs.filter(log => log.type !== 'info').slice(0, 10);
+    if (warningLogs.length) {
+        warningLogs.forEach(log => {
+            const item = document.createElement('div');
+            item.className = 'warning-log-item';
+            const message = document.createElement('span');
+            message.textContent = log.message;
+            const time = document.createElement('span');
+            time.textContent = log.time;
+            item.append(message, time);
+            warningLogDiv.appendChild(item);
+        });
     } else {
-        warningLogDiv.innerHTML = '<p style="text-align:center;color:#64748b;">No warnings recorded</p>';
+        const empty = document.createElement('p');
+        empty.style.cssText = 'text-align:center;color:#64748b';
+        empty.textContent = 'No warnings recorded';
+        warningLogDiv.appendChild(empty);
     }
+
+    const oralResponses = document.getElementById('oral-responses-summary');
+    oralResponses.replaceChildren();
+    state.verification.responses.forEach((response, index) => {
+        const item = document.createElement('div');
+        item.className = 'warning-log-item';
+        const text = document.createElement('span');
+        text.textContent = `Question ${index + 1}: ${response || 'No response captured'}`;
+        item.appendChild(text);
+        oralResponses.appendChild(item);
+    });
 }
 
 document.getElementById('restart-btn')?.addEventListener('click', () => {
     location.reload();
+});
+
+document.getElementById('retry-exam-submit-btn')?.addEventListener('click', () => {
+    if (state.exam.submissionStatus === 'saved') saveVerificationResponses();
+    else submitExamSession();
 });
 
 // ============================================
@@ -999,21 +1475,36 @@ document.getElementById('restart-btn')?.addEventListener('click', () => {
 document.getElementById('prev-btn')?.addEventListener('click', () => {
     saveCurrentAnswer();
     if (state.exam.currentQuestion > 0) {
-        state.exam.currentQuestion--;
+        questionNavigation.previous();
+        state.exam.currentQuestion = questionNavigation.index;
         loadQuestion(state.exam.currentQuestion);
     }
 });
 
 document.getElementById('next-btn')?.addEventListener('click', () => {
+    if (lifecycle.status !== 'active') return;
     saveCurrentAnswer();
-    if (state.exam.currentQuestion < examQuestions.length - 1) {
-        state.exam.currentQuestion++;
+    const next = questionNavigation.next();
+    state.exam.currentQuestion = next.index;
+    if (next.mode === 'review') openReview();
+    else {
         loadQuestion(state.exam.currentQuestion);
     }
 });
 
+document.getElementById('review-back-btn')?.addEventListener('click', () => {
+    questionNavigation.previous();
+    state.exam.currentQuestion = questionNavigation.index;
+    loadQuestion(state.exam.currentQuestion);
+    showScreen('exam-screen');
+});
+
+document.getElementById('review-submit-btn')?.addEventListener('click', () => {
+    if (confirm('Submit your exam now?')) endExam(false);
+});
+
 document.getElementById('submit-exam-btn')?.addEventListener('click', () => {
-    if (confirm('Are you sure you want to submit your exam?')) {
+    if (lifecycle.status === 'active' && confirm('Are you sure you want to submit your exam?')) {
         endExam(false);
     }
 });
@@ -1026,33 +1517,29 @@ async function init() {
     await fetchQuestions();
 
     // Check inputs for enabling start button
-    const checkInputs = () => {
-        const name = document.getElementById('student-name').value.trim();
-        const id = document.getElementById('student-id').value.trim();
-        const allChecksPassed = document.querySelectorAll('.check-item.passed').length >= 3;
-        document.getElementById('start-exam-btn').disabled = !(name && id && allChecksPassed);
-    };
+    document.getElementById('student-name').addEventListener('input', updateStartAvailability);
+    document.getElementById('student-id').addEventListener('input', updateStartAvailability);
 
-    document.getElementById('student-name').addEventListener('input', checkInputs);
-    document.getElementById('student-id').addEventListener('input', checkInputs);
-
-    // Initialize camera and face mesh
-    await initCamera();
-    await initFaceMesh();
+    // Request camera and microphone independently so one denial does not mask the other.
+    await Promise.all([initCamera(), initMicrophone(), initFaceMesh()]);
 
     // Start preview face detection
     const previewVideo = document.getElementById('preview-video');
     previewVideo.onloadedmetadata = () => {
         startFaceDetection(previewVideo);
     };
+    if (previewVideo.readyState >= 1) startFaceDetection(previewVideo);
 
-    // Check fullscreen capability
-    if (document.documentElement.requestFullscreen) {
+    if (fullscreenSupported()) {
         document.getElementById('check-fullscreen').classList.add('passed');
+        document.getElementById('check-fullscreen').classList.remove('failed');
         document.getElementById('check-fullscreen').querySelector('.check-icon').textContent = '✅';
+    } else {
+        document.getElementById('check-fullscreen').classList.add('failed');
+        document.getElementById('check-fullscreen').querySelector('.check-icon').textContent = '❌';
     }
 
-    checkInputs();
+    updateStartAvailability();
 }
 
 // Start button handler

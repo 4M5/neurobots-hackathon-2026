@@ -1,0 +1,19 @@
+# Generated training data and model artifact (create locally with the training scripts)
+behavior_dataset.csv
+behavior_model.pkl
+behavior_validation_split.csv
+behavior_test_split.csv
+model_metadata.json
+evaluation_results.json
+validation_threshold_analysis.csv
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local environment and Python bytecode
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+tests/.deps/

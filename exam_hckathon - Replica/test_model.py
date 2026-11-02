@@ -1,304 +1,146 @@
-"""
-test_model.py
-=============
-Tests the trained IsolationForest model on new samples.
-Loads the saved model and evaluates it on:
-1. Held-out samples from the dataset
-2. Custom suspicious samples for demonstration
+"""Evaluate the saved model on the independently held-out test split.
 
-Predictions:
-- NORMAL: Behavior is within expected patterns
-- ANOMALY: Behavior deviates significantly (potential cheating)
+Optional interactive scoring is a demonstration only and is not part of the
+evaluation metrics.
 """
 
-import pandas as pd
-import numpy as np
+import argparse
+import json
+from pathlib import Path
+
 import joblib
-import os
+import numpy as np
+import pandas as pd
 
-def load_model(model_path='behavior_model.pkl'):
-    """
-    Load the trained model, scaler, and feature columns.
-    """
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model not found: {model_path}\n"
-            "Please run train_model.py first!"
-        )
-    
-    model_data = joblib.load(model_path)
-    return model_data['model'], model_data['scaler'], model_data['feature_columns']
+from ml_service import BehaviorModelService, FEATURE_COLUMNS
+from train_model import LABEL_COLUMN, _metrics_for_threshold, validate_dataset
 
 
-def predict_behavior(model, scaler, samples, feature_columns):
-    """
-    Predict whether samples are normal or anomalous.
-    
-    Returns:
-    --------
-    predictions : array
-        1 = Normal, -1 = Anomaly
-    scores : array
-        Anomaly scores (lower = more anomalous)
-    """
-    # Ensure samples are in correct format
-    if isinstance(samples, dict):
-        samples = pd.DataFrame([samples])
-    elif isinstance(samples, list):
-        samples = pd.DataFrame(samples)
-    
-    # Ensure correct column order
-    samples = samples[feature_columns]
-    
-    # Scale features
-    X_scaled = scaler.transform(samples)
-    
-    # Get predictions and anomaly scores
-    predictions = model.predict(X_scaled)
-    scores = model.decision_function(X_scaled)
-    
+def load_model(model_path="behavior_model.pkl"):
+    path = Path(model_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Model not found: {path}. Run train_model.py first.")
+    artifact = joblib.load(path)
+    if not isinstance(artifact, dict):
+        raise ValueError("Model artifact must be an object")
+    required = {"model", "scaler", "feature_columns"}
+    if not required.issubset(artifact):
+        raise ValueError("Model artifact is missing required training fields")
+    if tuple(artifact["feature_columns"]) != FEATURE_COLUMNS:
+        raise ValueError("Model artifact feature columns do not match the current schema")
+    return artifact
+
+
+def load_test_split(test_path, metadata):
+    test_path = Path(test_path)
+    if not test_path.is_file():
+        raise FileNotFoundError(f"Held-out test split not found: {test_path}. Run train_model.py first.")
+    frame = pd.read_csv(test_path)
+    if "source_index" not in frame.columns:
+        raise ValueError("Test split must include source_index values")
+    source_ids = set(pd.to_numeric(frame.pop("source_index"), errors="raise").astype(int))
+    split_metadata = metadata.get("splits")
+    if not isinstance(split_metadata, dict) or not {"train", "validation", "test"}.issubset(split_metadata):
+        raise ValueError("Artifact metadata does not contain audited split information")
+    train_ids = set(split_metadata["train"].get("source_indices", []))
+    validation_ids = set(split_metadata["validation"].get("source_indices", []))
+    expected_test_ids = set(split_metadata["test"].get("source_indices", []))
+    if not source_ids or len(source_ids) != len(frame) or source_ids != expected_test_ids:
+        raise ValueError("Test split rows do not match the model metadata")
+    if source_ids & train_ids or source_ids & validation_ids or train_ids & validation_ids:
+        raise ValueError("Recorded train, validation, and test splits are not independent")
+    return validate_dataset(frame)
+
+
+def predict_behavior(model, scaler, samples, feature_columns, decision_threshold=None):
+    if tuple(feature_columns) != FEATURE_COLUMNS:
+        raise ValueError("Feature columns do not match the model schema")
+    values = samples.loc[:, feature_columns]
+    if values.isna().any().any() or not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise ValueError("Prediction features must be finite numeric values")
+    transformed = scaler.transform(values)
+    scores = np.asarray(model.decision_function(transformed), dtype=float)
+    if decision_threshold is None:
+        predictions = np.asarray(model.predict(transformed), dtype=int)
+    else:
+        predictions = np.where(scores < float(decision_threshold), -1, 1)
     return predictions, scores
 
 
-def test_on_dataset():
-    """
-    Test model on samples from the original dataset.
-    """
-    print("\n" + "=" * 60)
-    print("TESTING ON DATASET SAMPLES")
-    print("=" * 60)
-    
-    # Load model
-    model, scaler, feature_columns = load_model()
-    
-    # Load dataset
-    df = pd.read_csv('behavior_dataset.csv')
-    X = df[feature_columns]
-    y_true = df['label']
-    
-    # Get predictions for all samples
-    predictions, scores = predict_behavior(model, scaler, X, feature_columns)
-    
-    # Convert IsolationForest output to our labels
-    # IsolationForest: 1 = normal (inlier), -1 = anomaly (outlier)
-    y_pred = np.where(predictions == 1, 0, 1)  # 0 = normal, 1 = anomaly
-    
-    # Calculate metrics
-    true_positives = np.sum((y_pred == 1) & (y_true == 1))
-    true_negatives = np.sum((y_pred == 0) & (y_true == 0))
-    false_positives = np.sum((y_pred == 1) & (y_true == 0))
-    false_negatives = np.sum((y_pred == 0) & (y_true == 1))
-    
-    accuracy = (true_positives + true_negatives) / len(y_true)
-    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    print(f"\nResults on full dataset ({len(df)} samples):")
-    print("-" * 40)
-    print(f"True Positives (cheaters detected):  {true_positives}")
-    print(f"True Negatives (normal confirmed):   {true_negatives}")
-    print(f"False Positives (false alarms):      {false_positives}")
-    print(f"False Negatives (cheaters missed):   {false_negatives}")
-    print("-" * 40)
-    print(f"Accuracy:  {accuracy:.2%}")
-    print(f"Precision: {precision:.2%}")
-    print(f"Recall:    {recall:.2%}")
-    print(f"F1-Score:  {f1:.2%}")
+def evaluate_test_split(artifact, test_frame):
+    model, scaler = artifact["model"], artifact["scaler"]
+    threshold = artifact.get("decision_threshold")
+    if threshold is None:
+        raise ValueError("This artifact has no validation-calibrated threshold; retrain it with train_model.py")
+    predictions, scores = predict_behavior(model, scaler, test_frame, FEATURE_COLUMNS, threshold)
+    y_pred = (predictions == -1).astype(int)
+    metrics = _metrics_for_threshold(test_frame[LABEL_COLUMN].to_numpy(dtype=int), scores, threshold)
+    if not np.array_equal(y_pred, (scores < threshold).astype(int)):
+        raise RuntimeError("Prediction threshold and evaluation metrics disagree")
+    expected = (artifact.get("metadata") or {}).get("test_metrics")
+    if expected:
+        for key in ("precision", "recall", "f1", "false_positive_rate"):
+            if not np.isclose(metrics[key], expected[key], rtol=1e-12, atol=1e-12):
+                raise ValueError("Stored test metrics do not match recalculated held-out metrics")
+        for key in ("confusion_matrix", "tn", "fp", "fn", "tp", "support"):
+            if metrics[key] != expected[key]:
+                raise ValueError("Stored test metrics do not match recalculated held-out metrics")
+    return metrics
 
 
-def test_suspicious_samples():
-    """
-    Test model on custom suspicious samples.
-    """
-    print("\n" + "=" * 60)
-    print("TESTING SUSPICIOUS SAMPLES")
-    print("=" * 60)
-    
-    # Load model
-    model, scaler, feature_columns = load_model()
-    
-    # Create some test cases
-    test_cases = [
-        {
-            'name': 'Normal Student (Alice)',
-            'description': 'Consistent typing, minimal tab switches',
-            'features': {
-                'avg_key_interval': 0.2,
-                'std_key_interval': 0.05,
-                'typing_speed': 220,
-                'backspace_rate': 0.06,
-                'paste_count': 0,
-                'tab_switch': 1,
-                'focus_loss': 0,
-                'avg_idle': 5,
-                'max_idle': 15,
-                'edit_count': 5,
-                'time_to_first_key': 8,
-                'answer_duration': 180
-            }
-        },
-        {
-            'name': 'Suspicious Student (Bob)',
-            'description': 'High paste count, many tab switches',
-            'features': {
-                'avg_key_interval': 0.02,
-                'std_key_interval': 0.25,
-                'typing_speed': 750,
-                'backspace_rate': 0.01,
-                'paste_count': 8,
-                'tab_switch': 15,
-                'focus_loss': 10,
-                'avg_idle': 35,
-                'max_idle': 120,
-                'edit_count': 1,
-                'time_to_first_key': 45,
-                'answer_duration': 25
-            }
-        },
-        {
-            'name': 'Normal Student (Carol)',
-            'description': 'Slightly slower typing, normal behavior',
-            'features': {
-                'avg_key_interval': 0.25,
-                'std_key_interval': 0.06,
-                'typing_speed': 180,
-                'backspace_rate': 0.08,
-                'paste_count': 1,
-                'tab_switch': 0,
-                'focus_loss': 1,
-                'avg_idle': 8,
-                'max_idle': 25,
-                'edit_count': 6,
-                'time_to_first_key': 10,
-                'answer_duration': 250
-            }
-        },
-        {
-            'name': 'Very Suspicious (Dave)',
-            'description': 'Extreme paste behavior, no typing',
-            'features': {
-                'avg_key_interval': 0.01,
-                'std_key_interval': 0.3,
-                'typing_speed': 900,
-                'backspace_rate': 0.0,
-                'paste_count': 12,
-                'tab_switch': 20,
-                'focus_loss': 12,
-                'avg_idle': 50,
-                'max_idle': 150,
-                'edit_count': 0,
-                'time_to_first_key': 1,
-                'answer_duration': 15
-            }
-        },
-        {
-            'name': 'Borderline Case (Eve)',
-            'description': 'Some suspicious but explainable behavior',
-            'features': {
-                'avg_key_interval': 0.15,
-                'std_key_interval': 0.1,
-                'typing_speed': 280,
-                'backspace_rate': 0.04,
-                'paste_count': 2,
-                'tab_switch': 4,
-                'focus_loss': 2,
-                'avg_idle': 12,
-                'max_idle': 40,
-                'edit_count': 3,
-                'time_to_first_key': 5,
-                'answer_duration': 150
-            }
-        }
-    ]
-    
-    print("\nAnalyzing individual student behaviors:\n")
-    
-    for i, case in enumerate(test_cases, 1):
-        features_df = pd.DataFrame([case['features']])
-        predictions, scores = predict_behavior(model, scaler, features_df, feature_columns)
-        
-        result = "✅ NORMAL" if predictions[0] == 1 else "🚨 ANOMALY"
-        score = scores[0]
-        
-        print(f"[{i}] {case['name']}")
-        print(f"    Description: {case['description']}")
-        print(f"    Prediction:  {result}")
-        print(f"    Anomaly Score: {score:.4f}")
-        print(f"    (Lower scores = more anomalous)")
-        print()
-
-
-def interactive_test():
-    """
-    Allow testing with custom input.
-    """
-    print("\n" + "=" * 60)
-    print("INTERACTIVE TESTING")
-    print("=" * 60)
-    
-    model, scaler, feature_columns = load_model()
-    
-    print("\nEnter your own behavior data to test:")
-    print("(Press Enter to use default values)\n")
-    
+def interactive_score(artifact):
     defaults = {
-        'avg_key_interval': 0.2,
-        'std_key_interval': 0.05,
-        'typing_speed': 200,
-        'backspace_rate': 0.05,
-        'paste_count': 0,
-        'tab_switch': 1,
-        'focus_loss': 0,
-        'avg_idle': 5,
-        'max_idle': 20,
-        'edit_count': 4,
-        'time_to_first_key': 10,
-        'answer_duration': 150
+        "avg_key_interval": 0.2,
+        "std_key_interval": 0.05,
+        "typing_speed": 200,
+        "backspace_rate": 0.05,
+        "paste_count": 0,
+        "tab_switch": 1,
+        "focus_loss": 0,
+        "avg_idle": 5,
+        "max_idle": 20,
+        "edit_count": 4,
+        "time_to_first_key": 10,
+        "answer_duration": 150,
     }
-    
     sample = {}
     for feature, default in defaults.items():
-        try:
-            value = input(f"  {feature} [{default}]: ").strip()
-            sample[feature] = float(value) if value else default
-        except ValueError:
-            sample[feature] = default
-    
-    features_df = pd.DataFrame([sample])
-    predictions, scores = predict_behavior(model, scaler, features_df, feature_columns)
-    
-    result = "✅ NORMAL" if predictions[0] == 1 else "🚨 ANOMALY"
-    
-    print(f"\n{'='*40}")
-    print(f"Result: {result}")
-    print(f"Anomaly Score: {scores[0]:.4f}")
-    print(f"{'='*40}")
+        entered = input(f"{feature} [{default}]: ").strip()
+        sample[feature] = float(entered) if entered else default
+    features = BehaviorModelService.validate_features(sample)
+    frame = pd.DataFrame([[features[column] for column in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
+    predictions, scores = predict_behavior(
+        artifact["model"], artifact["scaler"], frame, FEATURE_COLUMNS, artifact.get("decision_threshold")
+    )
+    print(f"Illustrative score only: {'review' if predictions[0] == -1 else 'no model flag'}")
+    print(f"Decision score: {scores[0]:.6f}")
+    print("This single example is not an evaluation result or evidence of cheating.")
 
 
 def main():
-    """
-    Main testing pipeline.
-    """
-    print("=" * 60)
-    print("EXAM BEHAVIOR ANOMALY DETECTION")
-    print("Model Testing & Evaluation")
-    print("=" * 60)
-    
-    # Run tests
-    test_suspicious_samples()
-    test_on_dataset()
-    
-    # Ask if user wants interactive testing
-    print("\n" + "-" * 60)
-    try:
-        response = input("\nWould you like to test custom behavior? (y/n): ").strip().lower()
-        if response == 'y':
-            interactive_test()
-    except (EOFError, KeyboardInterrupt):
-        pass
-    
-    print("\n✓ Testing complete!")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="behavior_model.pkl")
+    parser.add_argument("--test-split", default="behavior_test_split.csv")
+    parser.add_argument("--interactive", action="store_true", help="Optionally score a hand-entered example after evaluation")
+    args = parser.parse_args()
+
+    artifact = load_model(args.model)
+    metadata = artifact.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("Model artifact has no evaluation metadata")
+    test_frame = load_test_split(args.test_split, metadata)
+    metrics = evaluate_test_split(artifact, test_frame)
+    print("Held-out test split diagnostics (dataset limitations still apply):")
+    print(f"Samples: {metrics['support']}")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    print(f"F1: {metrics['f1']:.4f}")
+    print("Confusion matrix [[TN, FP], [FN, TP]]:")
+    print(json.dumps(metrics["confusion_matrix"]))
+    print(f"Validation-selected threshold: {metrics['threshold']:.8f}")
+    print("These metrics describe only this held-out split; synthetic metrics do not estimate school performance.")
+    if args.interactive:
+        interactive_score(artifact)
 
 
 if __name__ == "__main__":

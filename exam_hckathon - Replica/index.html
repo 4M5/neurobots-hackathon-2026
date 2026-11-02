@@ -55,8 +55,8 @@
                 </div>
 
                 <div class="student-info">
-                    <input type="text" id="student-name" placeholder="Enter your name" required>
-                    <input type="text" id="student-id" placeholder="Enter your Student ID" required>
+                    <input type="text" id="student-name" placeholder="Enter your name" maxlength="100" autocomplete="name" required>
+                    <input type="text" id="student-id" placeholder="Enter your Student ID" maxlength="64" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9._/-]{0,63}" required>
                 </div>
 
                 <button id="start-exam-btn" class="primary-btn" disabled>
@@ -198,6 +198,21 @@
         </div>
     </div>
 
+    <!-- Exam review screen -->
+    <div id="review-screen" class="screen">
+        <div class="verification-container review-container">
+            <div class="verification-header">
+                <h1>Review your answers</h1>
+                <p>Check which questions you answered and return to any answer before submitting.</p>
+            </div>
+            <div id="review-question-list" class="review-question-list"></div>
+            <div class="verification-controls">
+                <button id="review-back-btn" class="nav-btn">← Return to exam</button>
+                <button id="review-submit-btn" class="submit-btn">Submit Exam</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Oral Verification Screen -->
     <div id="verification-screen" class="screen">
         <div class="verification-container">
@@ -261,6 +276,19 @@
                 </div>
             </div>
 
+            <div class="warning-log-summary" aria-live="polite">
+                <h3>Secure Submission</h3>
+                <p id="exam-submission-status">Saving your exam securely…</p>
+                <button id="retry-exam-submit-btn" class="nav-btn" type="button" hidden>Retry submission</button>
+            </div>
+
+            <div class="warning-log-summary">
+                <h3>Behavior Model Review</h3>
+                <div id="ml-prediction-summary" class="warning-log-list">
+                    <p>Model result will appear after submission if the trained model is available.</p>
+                </div>
+            </div>
+
             <div class="integrity-score">
                 <h2>Integrity Score</h2>
                 <div class="score-circle" id="score-circle">
@@ -276,10 +304,16 @@
                 </div>
             </div>
 
+            <div class="warning-log-summary">
+                <h3>Oral Verification Responses</h3>
+                <div id="oral-responses-summary" class="warning-log-list"></div>
+            </div>
+
             <button id="restart-btn" class="primary-btn">Start New Exam</button>
         </div>
     </div>
 
+    <script src="exam-lifecycle.js"></script>
     <script src="app.js"></script>
 </body>
 

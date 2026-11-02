@@ -1,179 +1,104 @@
-"""
-generate_dataset.py
-====================
-Generates a synthetic dataset of exam behavior for anomaly detection.
-Contains both NORMAL exam-taking behavior and CHEATING (anomalous) behavior.
+"""Generate a reproducible synthetic dataset for pipeline development only.
 
-Features generated:
-- avg_key_interval: Average time between keystrokes (seconds)
-- std_key_interval: Standard deviation of keystroke intervals
-- typing_speed: Characters per minute
-- backspace_rate: Ratio of backspaces to total keystrokes
-- paste_count: Number of paste operations detected
-- tab_switch: Number of tab/window switches
-- focus_loss: Number of times the exam window lost focus
-- avg_idle: Average idle time between actions (seconds)
-- max_idle: Maximum idle time (seconds)
-- edit_count: Number of answer edits/modifications
-- time_to_first_key: Time from question display to first keystroke (seconds)
-- answer_duration: Total time spent answering (seconds)
+The labels describe generated patterns, not observed cheating. They are not
+ground truth about how real students behave.
 """
+
+import argparse
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# Set random seed for reproducibility
-np.random.seed(42)
 
-def generate_normal_samples(n_samples=800):
-    """
-    Generate samples representing NORMAL exam-taking behavior.
-    Normal students type consistently, don't switch tabs frequently,
-    and don't paste content.
-    """
+def generate_normal_samples(n_samples=800, rng=None):
+    """Generate synthetic samples from the hand-authored normal profile."""
+    rng = np.random.default_rng(42) if rng is None else rng
     data = {
-        # Consistent typing intervals (0.1-0.3 seconds between keys)
-        'avg_key_interval': np.random.uniform(0.1, 0.3, n_samples),
-        'std_key_interval': np.random.uniform(0.02, 0.08, n_samples),
-        
-        # Moderate typing speed (150-300 characters per minute)
-        'typing_speed': np.random.uniform(150, 300, n_samples),
-        
-        # Low backspace rate (normal corrections)
-        'backspace_rate': np.random.uniform(0.02, 0.1, n_samples),
-        
-        # No or minimal paste operations
-        'paste_count': np.random.choice([0, 1], n_samples, p=[0.9, 0.1]),
-        
-        # Minimal tab switching (0-2 times)
-        'tab_switch': np.random.choice([0, 1, 2], n_samples, p=[0.7, 0.2, 0.1]),
-        
-        # Minimal focus loss (0-1 times)
-        'focus_loss': np.random.choice([0, 1], n_samples, p=[0.85, 0.15]),
-        
-        # Low idle time (2-10 seconds average)
-        'avg_idle': np.random.uniform(2, 10, n_samples),
-        
-        # Maximum idle under 30 seconds
-        'max_idle': np.random.uniform(5, 30, n_samples),
-        
-        # Moderate edit count (2-8 edits)
-        'edit_count': np.random.randint(2, 9, n_samples),
-        
-        # Quick start (2-15 seconds to first key)
-        'time_to_first_key': np.random.uniform(2, 15, n_samples),
-        
-        # Normal answer duration (60-300 seconds)
-        'answer_duration': np.random.uniform(60, 300, n_samples),
+        "avg_key_interval": rng.uniform(0.1, 0.3, n_samples),
+        "std_key_interval": rng.uniform(0.02, 0.08, n_samples),
+        "typing_speed": rng.uniform(150, 300, n_samples),
+        "backspace_rate": rng.uniform(0.02, 0.1, n_samples),
+        "paste_count": rng.choice([0, 1], n_samples, p=[0.9, 0.1]),
+        "tab_switch": rng.choice([0, 1, 2], n_samples, p=[0.7, 0.2, 0.1]),
+        "focus_loss": rng.choice([0, 1], n_samples, p=[0.85, 0.15]),
+        "avg_idle": rng.uniform(2, 10, n_samples),
+        "max_idle": rng.uniform(5, 30, n_samples),
+        "edit_count": rng.integers(2, 9, n_samples),
+        "time_to_first_key": rng.uniform(2, 15, n_samples),
+        "answer_duration": rng.uniform(60, 300, n_samples),
     }
-    
-    df = pd.DataFrame(data)
-    df['label'] = 0  # 0 = Normal
-    return df
+    frame = pd.DataFrame(data)
+    frame["label"] = 0
+    return frame
 
 
-def generate_cheating_samples(n_samples=200):
-    """
-    Generate samples representing CHEATING behavior (anomalies).
-    Cheaters often: copy-paste answers, switch tabs frequently,
-    have irregular typing patterns, or long idle periods.
-    """
+def generate_anomaly_samples(n_samples=200, rng=None):
+    """Generate synthetic anomalies from hand-authored extreme patterns."""
+    rng = np.random.default_rng(43) if rng is None else rng
     data = {
-        # Irregular typing intervals (either too fast or too slow)
-        'avg_key_interval': np.random.uniform(0.01, 0.05, n_samples),
-        'std_key_interval': np.random.uniform(0.15, 0.4, n_samples),
-        
-        # Either very fast (copy-paste) or very slow typing
-        'typing_speed': np.where(
-            np.random.random(n_samples) > 0.5,
-            np.random.uniform(500, 1000, n_samples),  # Suspiciously fast
-            np.random.uniform(30, 80, n_samples)       # Very slow (distracted)
+        "avg_key_interval": rng.uniform(0.01, 0.05, n_samples),
+        "std_key_interval": rng.uniform(0.15, 0.4, n_samples),
+        "typing_speed": np.where(
+            rng.random(n_samples) > 0.5,
+            rng.uniform(500, 1000, n_samples),
+            rng.uniform(30, 80, n_samples),
         ),
-        
-        # Low backspace rate (pasted content doesn't need corrections)
-        'backspace_rate': np.random.uniform(0.0, 0.02, n_samples),
-        
-        # High paste count (copying answers)
-        'paste_count': np.random.randint(3, 15, n_samples),
-        
-        # High tab switching (looking up answers)
-        'tab_switch': np.random.randint(5, 25, n_samples),
-        
-        # Frequent focus loss
-        'focus_loss': np.random.randint(3, 15, n_samples),
-        
-        # Higher idle times (reading external sources)
-        'avg_idle': np.random.uniform(20, 60, n_samples),
-        
-        # Very long maximum idle (stepping away or using phone)
-        'max_idle': np.random.uniform(60, 180, n_samples),
-        
-        # Low edit count (pasted answers aren't edited much)
-        'edit_count': np.random.randint(0, 2, n_samples),
-        
-        # Either very quick (had answer ready) or very slow start
-        'time_to_first_key': np.where(
-            np.random.random(n_samples) > 0.5,
-            np.random.uniform(0.5, 2, n_samples),   # Suspiciously quick
-            np.random.uniform(30, 90, n_samples)    # Very slow start
+        "backspace_rate": rng.uniform(0.0, 0.02, n_samples),
+        "paste_count": rng.integers(3, 15, n_samples),
+        "tab_switch": rng.integers(5, 25, n_samples),
+        "focus_loss": rng.integers(3, 15, n_samples),
+        "avg_idle": rng.uniform(20, 60, n_samples),
+        "max_idle": rng.uniform(60, 180, n_samples),
+        "edit_count": rng.integers(0, 2, n_samples),
+        "time_to_first_key": np.where(
+            rng.random(n_samples) > 0.5,
+            rng.uniform(0.5, 2, n_samples),
+            rng.uniform(30, 90, n_samples),
         ),
-        
-        # Either very short (quick paste) or very long duration
-        'answer_duration': np.where(
-            np.random.random(n_samples) > 0.5,
-            np.random.uniform(10, 30, n_samples),   # Too quick
-            np.random.uniform(400, 600, n_samples)  # Too long
+        "answer_duration": np.where(
+            rng.random(n_samples) > 0.5,
+            rng.uniform(10, 30, n_samples),
+            rng.uniform(400, 600, n_samples),
         ),
     }
-    
-    df = pd.DataFrame(data)
-    df['label'] = 1  # 1 = Cheating/Anomaly
-    return df
+    frame = pd.DataFrame(data)
+    frame["label"] = 1
+    return frame
+
+
+def generate_cheating_samples(n_samples=200, rng=None):
+    """Backward-compatible alias for old imports; labels are synthetic only."""
+    return generate_anomaly_samples(n_samples=n_samples, rng=rng)
+
+
+def generate_dataset(normal_samples=800, anomaly_samples=200, seed=42):
+    rng = np.random.default_rng(seed)
+    normal = generate_normal_samples(normal_samples, rng)
+    anomalies = generate_anomaly_samples(anomaly_samples, rng)
+    return pd.concat([normal, anomalies], ignore_index=True).sample(
+        frac=1, random_state=seed
+    ).reset_index(drop=True)
 
 
 def main():
-    """
-    Main function to generate and save the complete dataset.
-    """
-    print("=" * 60)
-    print("EXAM BEHAVIOR DATASET GENERATOR")
-    print("=" * 60)
-    
-    # Generate samples
-    print("\n[1/3] Generating normal behavior samples...")
-    normal_df = generate_normal_samples(n_samples=800)
-    print(f"      Generated {len(normal_df)} normal samples")
-    
-    print("\n[2/3] Generating cheating behavior samples...")
-    cheating_df = generate_cheating_samples(n_samples=200)
-    print(f"      Generated {len(cheating_df)} cheating samples")
-    
-    # Combine and shuffle
-    print("\n[3/3] Combining and shuffling dataset...")
-    full_dataset = pd.concat([normal_df, cheating_df], ignore_index=True)
-    full_dataset = full_dataset.sample(frac=1, random_state=42).reset_index(drop=True)
-    
-    # Save to CSV
-    output_file = 'behavior_dataset.csv'
-    full_dataset.to_csv(output_file, index=False)
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("DATASET SUMMARY")
-    print("=" * 60)
-    print(f"\nTotal samples: {len(full_dataset)}")
-    print(f"Normal samples: {len(full_dataset[full_dataset['label'] == 0])}")
-    print(f"Cheating samples: {len(full_dataset[full_dataset['label'] == 1])}")
-    print(f"\nFeatures: {list(full_dataset.columns[:-1])}")
-    print(f"\nDataset saved to: {output_file}")
-    
-    # Show sample statistics
-    print("\n" + "=" * 60)
-    print("SAMPLE STATISTICS (First 5 features)")
-    print("=" * 60)
-    print(full_dataset.describe().iloc[:, :5].round(3))
-    
-    print("\n✓ Dataset generation complete!")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=42, help="Seed for reproducible synthetic samples")
+    parser.add_argument("--normal-samples", type=int, default=800)
+    parser.add_argument("--anomaly-samples", type=int, default=200)
+    parser.add_argument("--output", default="behavior_dataset.csv")
+    args = parser.parse_args()
+    if args.normal_samples < 1 or args.anomaly_samples < 1:
+        parser.error("sample counts must be positive")
+
+    dataset = generate_dataset(args.normal_samples, args.anomaly_samples, args.seed)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    dataset.to_csv(output, index=False)
+    print(f"Generated {len(dataset)} synthetic samples with seed {args.seed}.")
+    print(f"Synthetic label counts: {dataset['label'].value_counts().sort_index().to_dict()}")
+    print(f"Dataset written to: {output}")
+    print("These generated labels are development examples, not real student ground truth.")
 
 
 if __name__ == "__main__":

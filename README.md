@@ -1,213 +1,195 @@
 # Exam Behavior Anomaly Detection
 
-An anomaly detection prototype for identifying potentially suspicious
-behavior during online exams.
+An IIT Palakkad Hackathon prototype for running an online exam and collecting a limited set of browser behavior signals. An Isolation Forest can flag an aggregate behavior summary for human review. A model flag or a rule warning is **not proof of cheating** and must not be used for automatic punishment.
 
-Developed as a team project for the IIT Palakkad Hackathon.
-
-## Overview
-
-Online exams generate behavioral signals such as typing patterns, tab
-switching, paste events, focus changes, and idle time. This project uses
-machine learning to identify behavior that deviates from normal patterns.
-
-The system uses Isolation Forest for anomaly detection and integrates
-the Gemini API to generate natural-language explanations of detected
-anomalies.
-
-This is a hackathon prototype and is not intended to definitively
-determine whether a student is cheating.
-
-## Features
-
-- Behavioral anomaly detection using Isolation Forest
-- Analysis of 12 behavioral features
-- Synthetic dataset generation
-- Model training and testing
-- Flask-based web application
-- Gemini API integration for anomaly explanations
-- Web interface for entering behavioral data and viewing results
-
-## Behavioral Features
-
-The model uses the following behavioral signals:
-
-- Average key interval
-- Standard deviation of key intervals
-- Typing speed
-- Backspace rate
-- Paste count
-- Tab switches
-- Focus loss
-- Average idle time
-- Maximum idle time
-- Answer edits
-- Time to first key
-- Answer duration
-
-## Machine Learning Approach
-
-The project uses **Isolation Forest**, an unsupervised anomaly detection
-algorithm.
-
-The model learns patterns from normal behavioral samples and assigns an
-anomaly score to new observations. Samples that significantly differ from
-the learned normal behavior are flagged as potential anomalies.
-
-An anomaly does not necessarily indicate cheating. Unusual behavior can
-also occur because of legitimate differences between users.
-
-## Dataset
-
-The current implementation uses synthetic behavioral data for
-demonstration and experimentation.
-
-- 800 normal samples
-- 200 anomalous samples
-- 12 behavioral features
-
-Since the dataset is synthetic, the results should not be interpreted as
-real-world cheating detection performance.
-
-## Gemini Integration
-
-Gemini is used to generate a natural-language explanation for detected
-anomalies.
-
-The API key can be configured through an environment variable:
+## Implemented architecture
 
 ```text
-GEMINI_API_KEY=your_api_key
+Browser (HTML/CSS/JavaScript)
+  ├─ camera permission + MediaPipe Face Mesh preview
+  ├─ browser focus, visibility, paste, typing, and timer events
+  ├─ question navigation, review, and optional post-exam speech recognition
+  └─ same-origin HTTP requests
+       └─ Flask (server.py)
+            ├─ Gemini question generation with validated offline fallback
+            ├─ /api/predict → ml_service.py → saved scaler + Isolation Forest
+            └─ exam session APIs → exam_storage.py → local SQLite
+```
 
-## Project Structure
+The frontend asks the Flask app for five questions. A Gemini key enables generation; otherwise the fixed fallback questions are returned. Exam start creates and activates a server-side session. Submission saves answers and proctoring counts using a per-session bearer token. Oral verification responses are saved separately after verification. The database contains student identifiers and answer data; see [`exam_hckathon - Replica/SECURITY.md`](exam_hckathon%20-%20Replica/SECURITY.md) before using real student records.
+
+The browser records camera frames for face tracking and browser events such as tab changes, focus loss, paste counts, keystroke intervals, and idle intervals. Audio activity is only a volume indicator. Speech recognition is used for optional oral verification after the written exam. The five-warning threshold flags manual review and does not terminate the exam.
+
+## Isolation Forest pipeline
+
+The current generator creates **synthetic** normal-profile and anomaly-profile samples. These are hand-authored patterns, not observations or ground-truth labels from students.
+
+`train_model.py` uses a seeded, stratified 70/15/15 train/validation/test split. It fits `StandardScaler` and Isolation Forest on normal-labeled rows from the training partition only. It selects a decision-score threshold by maximizing F1 on the validation partition, with deterministic tie-breaking. The test partition remains separate and is evaluated once with that fixed threshold. The saved metadata records the seed, source row indices, feature schema, scaler/model settings, software versions, threshold, and validation/test metrics. `test_model.py` verifies the saved test rows are disjoint from train and validation before recomputing test metrics.
+
+Metrics describe only the supplied dataset and its split. Synthetic results do not estimate performance on real students. The validation-selected threshold may not transfer to another class, exam, or population. Isolation Forest detects deviation from a learned distribution; it does not determine intent or explain why a behavior occurred.
+
+## Implemented and planned
+
+### Implemented
+
+- Flask app serving the frontend and JSON APIs.
+- Gemini question generation with schema and length validation plus fixed fallback questions.
+- Browser exam flow with setup checks, Face Mesh preview, rule-based event logging, question review, timer, written submission, and optional oral verification.
+- Five-warning manual-review flag; the warning threshold does not automatically terminate the exam.
+- SQLite-backed exam sessions with server-side student-ID validation, bearer-token authentication, state validation, and idempotent written submission.
+- Isolation Forest training and inference using the same ordered 12-feature schema and the saved preprocessing scaler.
+- Reproducible synthetic-data splits, validation threshold calibration, held-out test metrics, and model metadata.
+
+### Not implemented / not established
+
+- Verified cheating detection, real-world accuracy, or validation on real student data.
+- Automatic disciplinary decisions or automatic termination based on model predictions.
+- A teacher/admin dashboard or API for reviewing stored submissions.
+- Encryption at rest for SQLite data, a retention/deletion workflow, or production identity management.
+- A production-hardened deployment. Use the security notes and review privacy requirements before any school pilot.
+
+## Repository structure
 
 ```text
 .
-├── generate_dataset.py
-├── train_model.py
-├── test_model.py
-├── server.py
-├── index.html
-├── app.js
-├── styles.css
-├── requirements.txt
-└── README.md
-
-## Installation
-
-### 1. Clone the repository
-
-```bash
-git clone <your-fork-url>
-cd neurobots-hackathon-2026
+├── README.md
+└── exam_hckathon - Replica/
+    ├── server.py                    # Flask routes, app config, security headers
+    ├── exam_storage.py              # authenticated SQLite session persistence
+    ├── ml_service.py                # model loading, feature schema, inference
+    ├── generate_dataset.py          # reproducible synthetic data generation
+    ├── train_model.py               # split, fit, threshold calibration, evaluation
+    ├── test_model.py                # held-out evaluation and optional interactive demo
+    ├── index.html                   # exam UI
+    ├── app.js                       # browser exam lifecycle and API calls
+    ├── exam-lifecycle.js            # timer, navigation, and feature helpers
+    ├── styles.css
+    ├── requirements.txt
+    ├── requirements-dev.txt
+    ├── .env.example
+    ├── .gitignore
+    └── tests/
 ```
 
-### 2. Create a Python environment
+Generated files such as `behavior_dataset.csv`, `behavior_model.pkl`, split CSVs, evaluation JSON, and the SQLite database are ignored by Git. Recreate them locally with the commands below.
 
-Using Conda:
+## Setup
 
-```bash
-conda create -n exam_hack python=3.10 -y
-conda activate exam_hack
+Python 3.10 or newer is recommended. Run commands from the `exam_hckathon - Replica` directory.
+
+### Windows PowerShell
+
+```powershell
+cd "exam_hckathon - Replica"
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+Copy-Item .env.example .env
 ```
 
-Or using Python virtual environment:
+If PowerShell blocks activation, allow it for this terminal only:
 
-```bash
-python -m venv venv
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
 ```
 
-Activate on Windows:
+### Linux/macOS
 
 ```bash
-venv\Scripts\activate
+cd "exam_hckathon - Replica"
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+cp .env.example .env
 ```
 
-Activate on Linux/macOS:
+### Configure and create the model
+
+Edit `.env` only if needed. Set `GEMINI_API_KEY` to enable Gemini question generation; leaving it unset uses the fallback question set. The default model and database paths are local to this directory. Keep `.env` private.
 
 ```bash
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-
-### 1. Generate the dataset
-
-```bash
-python generate_dataset.py
-```
-
-### 2. Train the model
-
-```bash
-python train_model.py
-```
-
-### 3. Test the model
-
-```bash
+python generate_dataset.py --seed 42 --output behavior_dataset.csv
+python train_model.py --dataset behavior_dataset.csv --output-dir . --seed 42 --dataset-kind synthetic
 python test_model.py
 ```
 
-### 4. Configure Gemini API
+`test_model.py` evaluates `behavior_test_split.csv`, which is emitted by training. It reports precision, recall, F1, and the confusion matrix; it does not report a full-dataset or training-set score as test performance. `--interactive` optionally scores one manually entered example and is not an evaluation metric.
 
-Create a `.env` file:
+The saved `behavior_model.pkl` is required for `/api/predict`. Without it the Flask app remains available, but predictions return a model-unavailable response. `joblib` artifacts use pickle serialization: load only artifacts produced by a trusted training run.
 
-```text
-GEMINI_API_KEY=your_api_key_here
-```
-
-### 5. Start the application
+### Start the app
 
 ```bash
 python server.py
 ```
 
-Open the local Flask URL in your browser.
+Open <http://127.0.0.1:8000/>. The default development server binds to loopback and debug mode is off. The exam APIs require the page to be served by Flask or a same-origin reverse proxy; a static-only server cannot create or persist exam sessions. Production deployment instructions and data caveats are in [`SECURITY.md`](exam_hckathon%20-%20Replica/SECURITY.md).
 
-## Output
+## API
 
-The application analyzes behavioral features and predicts whether the
-submitted behavior is consistent with normal patterns or is potentially
-anomalous.
+All endpoints are served from the Flask origin. JSON API responses are not cached. Cross-origin clients must configure an exact comma-separated `CORS_ORIGINS` allowlist in `.env`; same-origin use needs no CORS entry.
 
-For anomalous results, Gemini generates a natural-language explanation
-of the detected behavioral patterns.
+### `GET /api/questions`
 
-## Limitations
+Returns five `{id, text, topic}` questions. Invalid or unavailable Gemini responses fall back to the fixed question list.
 
-- Uses synthetic behavioral data.
-- An anomaly does not necessarily indicate cheating.
-- Not validated on real examination data.
-- May produce false positives and false negatives.
-- Intended as a hackathon prototype, not a production system.
+### `POST /api/predict`
 
-## Future Improvements
+Scores a numeric behavior summary. It does not accept answers, student identity, or transcripts.
 
-- Evaluate on real-world behavioral datasets.
-- Add real-time event collection.
-- Compare multiple anomaly detection algorithms.
-- Improve dashboard visualization.
-- Integrate with online examination platforms.
+```json
+{
+  "features": {
+    "avg_key_interval": 0.2,
+    "std_key_interval": 0.05,
+    "typing_speed": 250,
+    "backspace_rate": 0.08,
+    "paste_count": 0,
+    "tab_switch": 1,
+    "focus_loss": 0,
+    "avg_idle": 3.0,
+    "max_idle": 8.0,
+    "edit_count": 2,
+    "time_to_first_key": 5.0,
+    "answer_duration": 120.0
+  }
+}
+```
 
-## Technologies
+Returns `prediction` (`1` inlier, `-1` anomaly), `is_anomaly`, the raw `decision_score`, and `alert_category` (`none` or `review`). A review result is not proof of cheating. Invalid feature schema or values return HTTP 400; missing model returns 503.
 
-- Python
-- Scikit-learn
-- Pandas
-- NumPy
-- Flask
-- Google Gemini API
-- HTML
-- CSS
-- JavaScript
+### `POST /api/exam-sessions`
 
-## Project Context
+Creates a `ready` session and returns its ID and one-time bearer token:
 
-Developed collaboratively as a team project during the **IIT Palakkad Hackathon**.
+```json
+{"student_name":"Example Student","student_id":"STU-123","question_count":5}
+```
+
+### `POST /api/exam-sessions/{session_id}/start`
+
+Activates a ready session. Requires `Authorization: Bearer <session_token>` and body `{}`.
+
+### `POST /api/exam-sessions/{session_id}/submit`
+
+Submits the written exam once. Requires the bearer token and JSON containing `answers` (one string per question), `proctoring` (the six event counters plus boolean `manual_review_recommended`), and exactly three `verification_responses` strings. Repeated authorized submissions are idempotent; changed data is not written after the first successful submission.
+
+### `PUT /api/exam-sessions/{session_id}/verification`
+
+Saves the three oral verification transcript strings after the written exam was submitted. Requires the same bearer token. The token is held in page memory and is not stored in browser local storage.
+
+## Tests
+
+```bash
+python -m pytest -q tests
+node --test tests/exam-lifecycle.test.js
+```
+
+Python tests cover feature validation, reproducible independent splits, validation-only threshold selection, confusion-matrix/metric calculation, model metadata, held-out evaluation, model loading, and Flask APIs. JavaScript tests cover timer lifecycle, question navigation, typing calculations, and behavior feature aggregation.
+
+## Dependencies and project context
+
+Runtime packages are listed in [`requirements.txt`](exam_hckathon%20-%20Replica/requirements.txt); test tooling is in [`requirements-dev.txt`](exam_hckathon%20-%20Replica/requirements-dev.txt). The project was developed for the IIT Palakkad Hackathon.
